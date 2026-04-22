@@ -2,15 +2,11 @@ from __future__ import annotations
 
 import json
 import random
-import sys
 from pathlib import Path
 from typing import Any
 
 
-from constants import CONF, DAB_ROOT, ROOT, RUN_DIR, SEED, assert_frozen_constraints
-
-if str(DAB_ROOT) not in sys.path:
-    sys.path.append(str(DAB_ROOT))
+from constants import CONF, ROOT, RUN_DIR, SEED, assert_frozen_constraints
 
 from prompt_runner import IncrementalClapMetricsLogger, read_prompt_items, run_single_prompt
 
@@ -61,7 +57,7 @@ def main() -> None:
     )
 
     device = str(CONF["device"])
-    model, discriminator, sampler = load_run_stack(CONF, dab_root=DAB_ROOT)
+    model, discriminator, sampler = load_run_stack(CONF)
 
     prompt_items = read_prompt_items(
         Path(str(CONF["prompt_csv"])),

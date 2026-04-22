@@ -8,9 +8,13 @@ from typing import Any
 
 import torch
 
-from core.dlp_embed import LangevinSampler
-from core.steering import compute_steered_loss
-from discriminator.discriminator_base import AR_EVENT_VOCAB_SIZE
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from sampler import LangevinSampler
+from steering import compute_steered_loss
+from dab_ttm.discriminator.discriminator_base import AR_EVENT_VOCAB_SIZE
 
 VERBOSE = True
 
@@ -42,12 +46,9 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def load_run_stack(conf: dict[str, Any], *, dab_root: Path) -> tuple[Any, Any, LangevinSampler]:
-    root = str(dab_root)
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    from core.discriminator_loading import load_ttm_discriminator
-    from core.generator_loading import load_base_model
+def load_run_stack(conf: dict[str, Any]) -> tuple[Any, Any, LangevinSampler]:
+    from discriminator_loading import load_ttm_discriminator
+    from generator_loading import load_base_model
 
     device = str(conf["device"])
     model = load_base_model(**conf["base_model_args"]).to(device)
