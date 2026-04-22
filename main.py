@@ -6,12 +6,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import torch
 
 from constants import CONF, DAB_ROOT, ROOT, RUN_DIR, SEED, assert_frozen_constraints
 
 if str(DAB_ROOT) not in sys.path:
-    sys.path.insert(0, str(DAB_ROOT))
+    sys.path.append(str(DAB_ROOT))
 
 from prompt_runner import IncrementalClapMetricsLogger, read_prompt_items, run_single_prompt
 

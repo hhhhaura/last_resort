@@ -12,9 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from core.dlp_embed import LangevinSampler
-from core.rolling import _decode_ids_simple, _save_rendered_outputs
-from utils.evaluation import get_cached_clap_model
-from utils.io import resolve_soundfont_for_wav
+from utils import _decode_ids_simple, _save_rendered_outputs, get_cached_clap_model, resolve_soundfont_for_wav
 
 from constants import MAX_RENDER_STEPS, RENDER_EVERY_STEP, SAVE_MIDI, SAVE_WAV, TRACE_NUM_STEPS
 from direct_grad_core import ids_hash, one_step_with_direct_norm_matched_bias
