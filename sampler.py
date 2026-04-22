@@ -5,18 +5,28 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dab_ttm.discriminator.discriminator_base import AR_EVENT_VOCAB_SIZE
-from weight_scheduler import build_step_weight_scheduler
+from constants import AR_EVENT_VOCAB_SIZE
 
-from base_sampler import BaseSampler
 from steering import compute_steered_loss
 
 EPS = 1e-10
+
+
+class BaseSampler(nn.Module):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+
+    def initialize_batch(self, model, seq_length):
+        raise NotImplementedError
+
+    def step(self, **kwargs):
+        raise NotImplementedError
 
 
 def _calc_grad_suffix(
@@ -232,14 +242,9 @@ class LangevinSampler(BaseSampler):
         if self.direct_grad_norm_match_ratio_min > self.direct_grad_norm_match_ratio_max:
             raise ValueError("direct_grad_norm_match_ratio_min must be <= direct_grad_norm_match_ratio_max.")
         self._langevin_step = 0
-        sched_cfg = dict(kwargs)
-        sched_cfg["weight_val"] = weight_val
-        self._sched_cfg = sched_cfg
-        self.weight_scheduler = build_step_weight_scheduler(sched_cfg)
         self.last_step_debug = {}
         self.prev_output_ids = None
         self.prev_pred_vecs = None
-        self._num_steps = int(max(kwargs.get("num_steps", 1), 1))
         self._set_bias_kwargs = {}
         self._debug_trace_sequences = bool(kwargs.get("debug_trace_sequences", False))
 
@@ -265,14 +270,7 @@ class LangevinSampler(BaseSampler):
         self.prev_output_ids = None
         self.prev_pred_vecs = None
         self._langevin_step = 0
-        num_steps_override = kwargs.pop("num_steps", None)
-        if num_steps_override is not None:
-            sched_cfg = dict(self._sched_cfg)
-            sched_cfg["num_steps"] = max(int(num_steps_override), 1)
-            self.weight_scheduler = build_step_weight_scheduler(sched_cfg)
-            self._num_steps = int(max(int(num_steps_override), 1))
-        else:
-            self._num_steps = int(max(self._sched_cfg.get("num_steps", 1), 1))
+        kwargs.pop("num_steps", None)
         self.model = model
         self.discriminator = discriminator
         self.active_vocab_size = int(
@@ -468,7 +466,7 @@ class LangevinSampler(BaseSampler):
     def step(self, x, **kwargs):
         """One Langevin step (DLP) via ``compute_steered_loss``."""
         del kwargs
-        steer_w = float(self.weight_scheduler(self._langevin_step))
+        steer_w = float(self.weight_val)
         cur_step_idx = int(self._langevin_step)
         scale_mode = self._resolve_scale_mode_for_step(step_idx=cur_step_idx)
         self.model.set_biases(

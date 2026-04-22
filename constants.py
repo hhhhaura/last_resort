@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from anticipation.vocab import CONTROL_OFFSET
+
+
+AR_EVENT_VOCAB_SIZE: int = int(CONTROL_OFFSET)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DAB_ROOT = ROOT / "dab_ttm"
@@ -14,7 +19,6 @@ CONF: dict = {
     "initialization": "zero",
     "initialization_noise_rate": 0.5,
     "weight_val": 0.8,
-    "weight_schedule": {"name": "constant", "delta": 0.0},
     "use_scale_weights": "full",
     "debug_trace_sequences": False,
     "loss_aggregation": "none",

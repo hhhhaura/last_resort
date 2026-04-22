@@ -14,7 +14,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from sampler import LangevinSampler
 from steering import compute_steered_loss
-from dab_ttm.discriminator.discriminator_base import AR_EVENT_VOCAB_SIZE
 
 VERBOSE = True
 
@@ -47,8 +46,8 @@ def set_seed(seed: int) -> None:
 
 
 def load_run_stack(conf: dict[str, Any]) -> tuple[Any, Any, LangevinSampler]:
-    from discriminator_loading import load_ttm_discriminator
-    from generator_loading import load_base_model
+    from discriminators import load_ttm_discriminator
+    from generators import load_base_model
 
     device = str(conf["device"])
     model = load_base_model(**conf["base_model_args"]).to(device)
@@ -106,105 +105,6 @@ def _calc_grad_suffix(
     return gx.detach()
 
 
-def _build_direct_norm_matched_bias(
-    *,
-    gx: torch.Tensor,
-    logits: torch.Tensor,
-    prompt_length: int,
-    steer_weight: float,
-    bias_shape: tuple[int, int, int],
-    ar_event_only: bool,
-    eps: float,
-    use_masked_full_vocab_norm: bool,
-    use_lm_topk_support_norm: bool,
-    topk_k: int,
-    active_vocab_size: int,
-    ratio_min: float,
-    ratio_max: float,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    bsz, gen_steps, vocab = bias_shape
-    bias = torch.zeros((bsz, gen_steps, vocab), device=gx.device, dtype=gx.dtype)
-    logits_suffix = torch.nan_to_num(
-        logits[:, int(prompt_length) :, :].float(),
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    )
-    gx = torch.nan_to_num(gx.float(), nan=0.0, posinf=0.0, neginf=0.0)
-    t = min(int(gx.shape[1]), int(logits_suffix.shape[1]), int(gen_steps))
-    if t <= 0:
-        return bias, {
-            "norm_match_ratio_mean": 0.0,
-            "norm_match_ratio_median": 0.0,
-            "norm_match_bn_tiny_frac": 1.0,
-            "norm_match_steps_used": 0.0,
-        }
-
-    v_keep = int(vocab)
-    if ar_event_only:
-        v_keep = min(v_keep, int(AR_EVENT_VOCAB_SIZE))
-    k_req = int(max(1, min(int(topk_k), int(v_keep)))) if use_lm_topk_support_norm else 0
-
-    gx_use = gx[:, :t, :v_keep]
-    logits_use = logits_suffix[:, :t, :v_keep]
-    b_raw = -gx_use
-    bn = b_raw.norm(p=2, dim=-1, keepdim=True)
-    bn_denom = bn.clamp_min(float(eps))
-    finite_mask = torch.isfinite(logits_use) & torch.isfinite(b_raw)
-    logits_masked = torch.where(finite_mask, logits_use, torch.zeros((), device=logits_use.device, dtype=logits_use.dtype))
-    ratio_parts: list[torch.Tensor] = []
-
-    if use_masked_full_vocab_norm:
-        ln_mask = logits_masked.norm(p=2, dim=-1, keepdim=True)
-        r = (ln_mask / bn_denom).clamp(min=float(ratio_min), max=float(ratio_max))
-        r = torch.nan_to_num(r, nan=0.0, posinf=float(ratio_max), neginf=float(ratio_min))
-        ratio_parts.append(r)
-
-    if use_lm_topk_support_norm:
-        k = int(k_req)
-        topk_ids = torch.topk(logits_masked, k=k, dim=-1).indices.to(dtype=torch.long)
-        z_logits = torch.gather(logits_masked, dim=-1, index=topk_ids).float()
-        z_g = torch.gather(b_raw, dim=-1, index=topk_ids).float()
-        ln_top = z_logits.norm(p=2, dim=-1, keepdim=True)
-        bn_top = z_g.norm(p=2, dim=-1, keepdim=True).clamp_min(float(eps))
-        r = (ln_top / bn_top).clamp(min=float(ratio_min), max=float(ratio_max))
-        r = torch.nan_to_num(r, nan=0.0, posinf=float(ratio_max), neginf=float(ratio_min))
-        ratio_parts.append(r)
-
-    if not ratio_parts:
-        ln = logits_use.norm(p=2, dim=-1, keepdim=True)
-        r = (ln / bn_denom).clamp(min=float(ratio_min), max=float(ratio_max))
-        r = torch.nan_to_num(r, nan=0.0, posinf=float(ratio_max), neginf=float(ratio_min))
-        ratio_parts.append(r)
-
-    scale = ratio_parts[0]
-    for r_extra in ratio_parts[1:]:
-        scale = torch.sqrt(torch.clamp(scale, min=float(ratio_min), max=float(ratio_max)) * r_extra)
-
-    scaled = b_raw * scale
-    scaled = torch.nan_to_num(scaled, nan=0.0, posinf=0.0, neginf=0.0)
-    scaled = scaled * float(steer_weight)
-    bias[:, :t, :v_keep] = scaled.to(dtype=bias.dtype)
-
-    ratio = scale.reshape(-1)
-    bn_flat = bn.reshape(-1)
-    tiny_frac = float((bn_flat <= float(eps)).float().mean().item())
-    ratio = torch.nan_to_num(ratio, nan=0.0, posinf=0.0, neginf=0.0)
-    stats = {
-        "norm_match_ratio_mean": float(ratio.mean().item()) if ratio.numel() else 0.0,
-        "norm_match_ratio_median": float(ratio.median().item()) if ratio.numel() else 0.0,
-        "norm_match_bn_tiny_frac": tiny_frac,
-        "norm_match_steps_used": float(t),
-        "norm_match_use_masked_full_vocab_norm": float(bool(use_masked_full_vocab_norm)),
-        "norm_match_use_lm_topk_support_norm": float(bool(use_lm_topk_support_norm)),
-        "norm_match_topk_k": float(k_req),
-        "norm_match_ratio_min": float(ratio_min),
-        "norm_match_ratio_max": float(ratio_max),
-        "norm_match_active_vocab_cap": float(int(active_vocab_size)),
-    }
-    return bias, stats
-
-
 def one_step_with_direct_norm_matched_bias(
     sampler: LangevinSampler,
     x: torch.Tensor,
@@ -218,7 +118,7 @@ def one_step_with_direct_norm_matched_bias(
     ratio_min: float,
     ratio_max: float,
 ) -> tuple[torch.Tensor, float, torch.Tensor, torch.Tensor, float, dict[str, Any]]:
-    steer_w = float(sampler.weight_scheduler(sampler._langevin_step))
+    steer_w = float(sampler.weight_val)
     cur_step_idx = int(sampler._langevin_step)
     if VERBOSE:
         print(f"\n[VERBOSE] === one_step_with_direct_norm_matched_bias step={cur_step_idx} steer_w={steer_w:.6f} ===")
