@@ -274,21 +274,26 @@ def one_step_with_direct_norm_matched_bias(
     active_vocab_size = int(
         getattr(sampler.discriminator, "active_vocab_size", int(sampler.model.get_input_embeddings().weight.size(0)))
     )
-    bias, nm_stats = _build_direct_norm_matched_bias(
-        gx=gx,
-        logits=logits,
-        prompt_length=prompt_length,
-        steer_weight=steer_w,
-        bias_shape=tuple(x.shape),
-        ar_event_only=ar_event_only,
-        eps=norm_match_eps,
-        use_masked_full_vocab_norm=use_masked_full_vocab_norm,
-        use_lm_topk_support_norm=use_lm_topk_support_norm,
-        topk_k=topk_k,
-        active_vocab_size=active_vocab_size,
-        ratio_min=ratio_min,
-        ratio_max=ratio_max,
-    )
+    # NOTE: bypass norm-matching and use direct negative gradient as bias.
+    # Original norm-matched construction is intentionally disabled:
+    # bias, nm_stats = _build_direct_norm_matched_bias(...)
+    bias = torch.zeros_like(x)
+    t_use = min(int(bias.shape[1]), int(gx.shape[1]))
+    v_use = min(int(bias.shape[2]), int(gx.shape[2]))
+    if t_use > 0 and v_use > 0:
+        bias[:, :t_use, :v_use] = -gx[:, :t_use, :v_use]
+    nm_stats = {
+        "norm_match_ratio_mean": -1.0,
+        "norm_match_ratio_median": -1.0,
+        "norm_match_bn_tiny_frac": -1.0,
+        "norm_match_steps_used": float(t_use),
+        "norm_match_use_masked_full_vocab_norm": -1.0,
+        "norm_match_use_lm_topk_support_norm": -1.0,
+        "norm_match_topk_k": -1.0,
+        "norm_match_ratio_min": -1.0,
+        "norm_match_ratio_max": -1.0,
+        "norm_match_active_vocab_cap": float(active_vocab_size),
+    }
 
     _loss_for_grad, output_ids, sampled_ids, attr_losses_np = sampler.compute_p_lm_soft(
         loss_for_grad, output_ids, onehot, logits, attr_losses
