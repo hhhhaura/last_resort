@@ -32,45 +32,11 @@ def _trace_seq(name: str, x: torch.Tensor, *, enabled: bool) -> None:
     )
 
 
-def _hard_onehot_ar_vocab(tok: torch.Tensor, *, ref: torch.Tensor) -> torch.Tensor:
-    tok = tok.long()
-    valid = (tok >= 0) & (tok < AR_EVENT_VOCAB_SIZE)
-    clamped = tok.clamp(0, AR_EVENT_VOCAB_SIZE - 1)
-    oh = F.one_hot(clamped, num_classes=AR_EVENT_VOCAB_SIZE).to(dtype=ref.dtype, device=ref.device)
-    return oh * valid.unsqueeze(-1).to(dtype=oh.dtype)
-
-
-def _bridge_soft_onehot_window(
-    onehot_generates: torch.Tensor,
-    output_ids: torch.Tensor,
-    prompt_length: int,
-    *,
-    max_generated_steps: int | None = None,
-):
-    """Content-only bridge: hard prompt prefix, soft generated suffix."""
-    pl = int(prompt_length)
-    bsz, t, _vdim = onehot_generates.shape
-    if pl <= 0:
-        return None
-    tok = output_ids[:, :pl].long()
-    hard_head = _hard_onehot_ar_vocab(tok, ref=onehot_generates)
-    if max_generated_steps is None:
-        tail_end = t
-    else:
-        tail_end = min(t, pl + max(int(max_generated_steps), 0))
-    soft_tail = onehot_generates[:, pl:tail_end, :AR_EVENT_VOCAB_SIZE]
-    return torch.cat([hard_head, soft_tail], dim=1)
-
-
 def _bridge_valid_mask(
     output_ids: torch.Tensor,
-    prompt_length: int,
     out_len: int,
-    *,
-    max_generated_steps: int | None = None,
 ) -> torch.Tensor:
     """Mask valid AR-event ids for bridge positions; control/special ids are removed."""
-    del prompt_length, max_generated_steps
     end = int(out_len)
     tok = output_ids[:, :end].long()
     if tok.shape[1] != int(out_len):
@@ -136,10 +102,8 @@ def compute_steered_loss(
     *,
     weight,
     prompt_length=None,
-    target_density=None,
     loss_aggregation: str = "none",
 ):
-    del target_density
     debug_trace = bool(inputs.get("debug_trace_sequences", False))
     output_ids, gpt_logit = model.forward_with_biases(
         **inputs,
@@ -173,27 +137,16 @@ def compute_steered_loss(
     onehot_generates = onehot_generates.detach().requires_grad_(True)
 
     gen_steps = max(int(gpt_logit.shape[1]) - int(prompt_length), 0)
-    bridged = _bridge_soft_onehot_window(
-        onehot_generates,
-        output_ids,
-        int(prompt_length),
-        max_generated_steps=gen_steps,
-    )
-    if bridged is not None:
-        disc_onehot = bridged.float()
-    else:
-        gen_oh = onehot_generates[:, prompt_length:, :].float()
-        if gen_oh.shape[-1] < AR_EVENT_VOCAB_SIZE:
-            raise ValueError(
-                f"Generator one-hot width {gen_oh.shape[-1]} < AR_EVENT_VOCAB_SIZE "
-                f"(CONTROL_OFFSET)={AR_EVENT_VOCAB_SIZE}"
-            )
-        disc_onehot = gen_oh[:, :, :AR_EVENT_VOCAB_SIZE]
+    del gen_steps
+    if onehot_generates.shape[-1] < AR_EVENT_VOCAB_SIZE:
+        raise ValueError(
+            f"Generator one-hot width {onehot_generates.shape[-1]} < AR_EVENT_VOCAB_SIZE "
+            f"(CONTROL_OFFSET)={AR_EVENT_VOCAB_SIZE}"
+        )
+    disc_onehot = onehot_generates[:, :, :AR_EVENT_VOCAB_SIZE].float()
     mask_gen = _bridge_valid_mask(
         output_ids,
-        int(prompt_length),
         int(disc_onehot.shape[1]),
-        max_generated_steps=gen_steps,
     )
     mask_gen = mask_gen.to(device=disc_onehot.device, dtype=disc_onehot.dtype)
     disc_onehot, mask_gen = _sanitize_disc_bridge_inputs(disc_onehot, mask_gen)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import array
 import hashlib
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -12,10 +13,65 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from sampler import LangevinSampler
 from steering import compute_steered_loss
 
 VERBOSE = True
+
+EPS = 1e-10
+
+
+@dataclass
+class DlpRuntime:
+    weight_val: Any
+    k_val: int
+    temp: float
+    device: str
+    weight_strat: Any
+    disc_weight: float
+    use_scale_weights: bool
+    initialization: str
+    initialization_noise_rate: float
+    loss_aggregation: str
+    bias_update_mode: str
+    debug_trace_sequences: bool = False
+
+    model: Any = None
+    discriminator: Any = None
+    inputs: dict[str, Any] | None = None
+    prompt_length: int = 0
+    active_vocab_size: int = 0
+    embed_map: Any = None
+    _set_bias_kwargs: dict[str, Any] = field(default_factory=dict)
+    _langevin_step: int = 0
+    last_step_debug: dict[str, Any] = field(default_factory=dict)
+
+
+def create_dlp_runtime(conf: dict[str, Any]) -> DlpRuntime:
+    loss_aggregation = str(conf.get("loss_aggregation", "none")).strip().lower()
+    if loss_aggregation != "none":
+        raise ValueError(
+            f"Unsupported loss_aggregation={conf.get('loss_aggregation')!r}. Only 'none' is supported."
+        )
+    bias_update_mode = str(conf.get("bias_update_mode", "sampled_l2")).strip().lower()
+    if bias_update_mode not in {"sampled_l2", "direct_grad"}:
+        raise ValueError(
+            "Unsupported bias_update_mode="
+            f"{conf.get('bias_update_mode')!r}. Use: sampled_l2 | direct_grad"
+        )
+    return DlpRuntime(
+        weight_val=conf["weight_val"],
+        k_val=int(conf.get("k_val", 250)),
+        temp=float(conf["proposal_temp"]),
+        device=str(conf["device"]),
+        weight_strat=conf.get("weight_strat", "uniform"),
+        disc_weight=float(conf.get("disc_weight", 0.9)),
+        use_scale_weights=bool(conf.get("use_scale_weights", True)),
+        initialization=conf.get("initialization", "random_disc"),
+        initialization_noise_rate=float(conf.get("initialization_noise_rate", 0.5)),
+        loss_aggregation=loss_aggregation,
+        bias_update_mode=bias_update_mode,
+        debug_trace_sequences=bool(conf.get("debug_trace_sequences", False)),
+    )
 
 
 def _vt(name: str, t: torch.Tensor, n: int = 5) -> None:
@@ -45,15 +101,15 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def load_run_stack(conf: dict[str, Any]) -> tuple[Any, Any, LangevinSampler]:
+def load_run_stack(conf: dict[str, Any]) -> tuple[Any, Any, DlpRuntime]:
     from discriminators import load_ttm_discriminator
     from generators import load_base_model
 
     device = str(conf["device"])
     model = load_base_model(**conf["base_model_args"]).to(device)
     discriminator = load_ttm_discriminator(**conf).to(device).eval()
-    sampler = LangevinSampler(**conf)
-    return model, discriminator, sampler
+    runtime = create_dlp_runtime(conf)
+    return model, discriminator, runtime
 
 
 def ids_hash(ids: list[int]) -> str:
@@ -61,16 +117,29 @@ def ids_hash(ids: list[int]) -> str:
     return hashlib.sha1(arr.tobytes()).hexdigest()[:12]
 
 
+def _trace_seq(runtime: DlpRuntime, name: str, x: torch.Tensor) -> None:
+    if not runtime.debug_trace_sequences:
+        return
+    flat = x.detach().cpu().reshape(-1).tolist()
+    print(
+        f"[dlp] trace {name}: shape={tuple(x.shape)} "
+        f"prefix10={flat[:10]} suffix10={flat[-10:] if flat else []}"
+    )
+
+
+def _resolve_scale_mode_for_step(runtime: DlpRuntime, *, step_idx: int) -> bool:
+    del step_idx
+    return runtime.use_scale_weights
+
+
 def _calc_grad_suffix(
-    sampler: LangevinSampler,
+    prompt_length: int,
     loss_for_grad: torch.Tensor,
     onehot: torch.Tensor,
     *,
     retain_graph: bool,
 ) -> torch.Tensor:
-    if not torch.is_tensor(loss_for_grad):
-        raise TypeError(f"loss_for_grad must be a tensor, got {type(loss_for_grad)}")
-    pl = int(sampler.prompt_length)
+    pl = int(prompt_length)
 
     if loss_for_grad.ndim != 1:
         raise ValueError(
@@ -101,32 +170,217 @@ def _calc_grad_suffix(
     return gx.detach()
 
 
+def get_unfiltered_dist(
+    runtime: DlpRuntime,
+    gx: torch.Tensor,
+    cur_token_ids: torch.Tensor,
+) -> torch.Tensor:
+    token_dist = torch.ones_like(gx).to(runtime.device)
+    cur = cur_token_ids[:, runtime.prompt_length :].long()
+    cur = cur.clamp(0, gx.shape[-1] - 1)
+    if cur.shape[1] != token_dist.shape[1]:
+        t = min(int(cur.shape[1]), int(token_dist.shape[1]))
+        cur = cur[:, :t]
+        token_dist = token_dist[:, :t, :]
+        gx = gx[:, :t, :]
+    token_dist[
+        torch.arange(token_dist.size(0))[:, None, None],
+        torch.arange(token_dist.size(1))[None, :, None],
+    ] = EPS
+    unfiltered_dist = gx * token_dist
+    return -1 * unfiltered_dist
+
+
+def _apply_filter(unfiltered_dist: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+    return unfiltered_dist[
+        torch.arange(unfiltered_dist.size(0))[:, None, None],
+        torch.arange(unfiltered_dist.size(1))[None, :, None],
+        topk_ids,
+    ]
+
+
+def _topk_to_tokens(topk_ids: torch.Tensor, sampled_indices: torch.Tensor) -> torch.Tensor:
+    return topk_ids[
+        torch.arange(topk_ids.size(0))[:, None],
+        torch.arange(topk_ids.size(1))[None, :],
+        sampled_indices,
+    ]
+
+
+def _sanitize_dist_logits(dist_logits: torch.Tensor) -> torch.Tensor:
+    finite = torch.isfinite(dist_logits)
+    valid_rows = finite.any(dim=-1)
+    if valid_rows.all():
+        return dist_logits
+    fixed = dist_logits.clone()
+    bad = ~valid_rows
+    fixed[bad, 0] = 0.0
+    fixed[bad, 1:] = -1e9
+    return fixed
+
+
+def get_dlp_dist(
+    runtime: DlpRuntime,
+    loss_for_grad: torch.Tensor,
+    onehot: torch.Tensor,
+    cur_token_ids: torch.Tensor,
+    logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    gx = _calc_grad_suffix(
+        runtime.prompt_length, loss_for_grad, onehot, retain_graph=False
+    )
+    runtime.last_step_debug["grad_norm"] = float(gx.float().norm().item())
+    logits = torch.nan_to_num(
+        logits[:, runtime.prompt_length :, :].float(),
+        nan=-1e9,
+        posinf=1e9,
+        neginf=-1e9,
+    )
+    if gx.shape[1] != logits.shape[1]:
+        t = min(int(gx.shape[1]), int(logits.shape[1]))
+        gx = gx[:, :t, :]
+        logits = logits[:, :t, :]
+    if runtime.active_vocab_size < logits.shape[-1]:
+        logits = logits.clone()
+        logits[:, :, runtime.active_vocab_size :] = -float("inf")
+    unfiltered_dist = get_unfiltered_dist(runtime, gx, cur_token_ids)
+    k = max(1, min(int(runtime.k_val), int(logits.shape[-1])))
+    topk_ids = torch.topk(logits, k, dim=-1).indices
+    return unfiltered_dist, topk_ids
+
+
+def compute_p_lm_soft(
+    runtime: DlpRuntime,
+    loss_for_grad: torch.Tensor,
+    output_ids: torch.Tensor,
+    onehot: torch.Tensor,
+    logits: torch.Tensor,
+    attr_losses: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]:
+    unfiltered_dist, topk_ids = get_dlp_dist(
+        runtime, loss_for_grad, onehot, output_ids, logits
+    )
+    dist_logits = _apply_filter(unfiltered_dist, topk_ids)
+    dist_logits = _sanitize_dist_logits(dist_logits)
+    proposal_dist = torch.distributions.Categorical(logits=dist_logits.float() / runtime.temp)
+    probs = torch.softmax(dist_logits.float() / runtime.temp, dim=-1)
+    entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1).mean()
+    runtime.last_step_debug["proposal_entropy"] = float(entropy.item())
+    sampled_indices = proposal_dist.sample()
+    sampled_tokens = _topk_to_tokens(topk_ids, sampled_indices)
+    prev_tokens = output_ids[:, runtime.prompt_length :].detach()
+    changed = (sampled_tokens != prev_tokens).float().mean()
+    runtime.last_step_debug["proposal_vs_decode_mismatch"] = float(changed.item())
+    return loss_for_grad, output_ids, sampled_tokens, attr_losses.detach().cpu().numpy()
+
+
+def compute_bias_l2_pen(
+    runtime: DlpRuntime,
+    sampled_ids: torch.Tensor,
+    steer_weight: float | None = None,
+) -> torch.Tensor:
+    sw = float(runtime.weight_val if steer_weight is None else steer_weight)
+    with torch.no_grad():
+        cur_embeds = runtime.embed_map(sampled_ids)
+        t1 = torch.einsum("ve -> v", [runtime.embed_map.weight**2])[None, None, :]
+        t2 = torch.einsum("bse, ve -> bsv", [cur_embeds, runtime.embed_map.weight])
+        t3 = torch.einsum("bse -> bs", [cur_embeds**2]).unsqueeze(-1)
+        bias = -1 * sw * (t1 - 2 * t2 + t3)
+    return bias
+
+
+def initialize_dlp_batch(
+    runtime: DlpRuntime,
+    model: Any,
+    discriminator: Any,
+    batch_size: int,
+    seq_length: int,
+    prompt_length: int,
+    inputs: dict[str, Any],
+    **kwargs: Any,
+) -> tuple[dict[str, Any], torch.Tensor]:
+    runtime._langevin_step = 0
+    kwargs.pop("num_steps", None)
+    runtime.model = model
+    runtime.discriminator = discriminator
+    runtime.active_vocab_size = int(
+        getattr(discriminator, "active_vocab_size", model.get_input_embeddings().weight.size(0))
+    )
+    runtime.inputs = inputs
+    runtime.debug_trace_sequences = bool(
+        inputs.get("debug_trace_sequences", runtime.debug_trace_sequences)
+    )
+    runtime.prompt_length = prompt_length
+    runtime._set_bias_kwargs = dict(kwargs)
+    init_scale_mode = _resolve_scale_mode_for_step(runtime, step_idx=0)
+    model.set_biases(
+        batch_size=batch_size,
+        seq_len=seq_length,
+        prompt_length=prompt_length,
+        attribute=None,
+        device=runtime.device,
+        disc_weight=runtime.weight_val,
+        use_scale_weights=init_scale_mode,
+        **kwargs,
+    )
+    runtime.embed_map = model.get_input_embeddings()
+    logit_dim = model.get_input_embeddings().weight.size(0)
+    embed_dim = model.get_input_embeddings().weight.size(1)
+    last_dim = logit_dim
+    if runtime.initialization == "random_disc":
+        sampled_ints = torch.randint(
+            0, logit_dim, (batch_size, seq_length - prompt_length)
+        ).to(runtime.device)
+        if last_dim == embed_dim:
+            initial_bias = runtime.embed_map(sampled_ints)
+        else:
+            initial_bias = compute_bias_l2_pen(runtime, sampled_ints)
+    elif runtime.initialization == "random_cont":
+        initial_bias = runtime.initialization_noise_rate * torch.randn(
+            batch_size, seq_length - prompt_length, last_dim
+        ).to(runtime.device)
+    elif runtime.initialization == "zero":
+        initial_bias = torch.zeros(
+            batch_size, seq_length - prompt_length, last_dim
+        ).to(runtime.device)
+    else:
+        raise ValueError(
+            f"Unsupported initialization mode: {runtime.initialization}. "
+            "Use: zero | random_disc | random_cont"
+        )
+    initial_bias = initial_bias.detach()
+    initial_bias.requires_grad = True
+    _trace_seq(runtime, "initialize.input_ids", inputs["input_ids"])
+    return inputs, initial_bias
+
+
 def one_step_direct_grad(
-    sampler: LangevinSampler,
+    runtime: DlpRuntime,
     x: torch.Tensor,
     *,
     prompt_length: int,
-) -> tuple[torch.Tensor, float, torch.Tensor, torch.Tensor, float, dict[str, Any]]:
-    steer_w = float(sampler.weight_val)
-    cur_step_idx = int(sampler._langevin_step)
+) -> tuple[torch.Tensor, float, torch.Tensor, float, dict[str, Any]]:
+    steer_w = float(runtime.weight_val)
+    cur_step_idx = int(runtime._langevin_step)
     if VERBOSE:
         print(f"\n[VERBOSE] === one_step_direct_grad step={cur_step_idx} steer_w={steer_w:.6f} ===")
         _vt("x (cur_batch input) [B,gen_steps,vocab]", x)
 
-    scale_mode = sampler._resolve_scale_mode_for_step(step_idx=cur_step_idx)
-    sampler.model.set_biases(
+    scale_mode = _resolve_scale_mode_for_step(runtime, step_idx=cur_step_idx)
+    assert runtime.model is not None
+    runtime.model.set_biases(
         batch_size=x.size(0),
         seq_len=x.size(1) + int(prompt_length),
         prompt_length=prompt_length,
         attribute=None,
-        device=sampler.device,
-        disc_weight=sampler.weight_val,
+        device=runtime.device,
+        disc_weight=runtime.weight_val,
         use_scale_weights=scale_mode,
-        **sampler._set_bias_kwargs,
+        **runtime._set_bias_kwargs,
     )
-    sampler.last_step_debug["scale_mode"] = str(scale_mode)
-    sampler._langevin_step += 1
-    sampler.last_step_debug["steer_weight"] = steer_w
+    runtime.last_step_debug["scale_mode"] = str(scale_mode)
+    runtime._langevin_step += 1
+    runtime.last_step_debug["steer_weight"] = steer_w
 
     batch_size = x.size(0)
     bias_dim = x.size(-1)
@@ -138,6 +392,7 @@ def one_step_direct_grad(
         dtype=x.dtype,
     )
     x_full = torch.cat([prompt_bias, x], dim=1)
+    assert runtime.inputs is not None and runtime.discriminator is not None
     (
         loss,
         loss_for_grad,
@@ -150,59 +405,59 @@ def one_step_direct_grad(
         _lm_reg,
         _loss_per_sample,
     ) = compute_steered_loss(
-        sampler.model,
-        sampler.discriminator,
-        sampler._inputs,
+        runtime.model,
+        runtime.discriminator,
+        runtime.inputs,
         x_full,
         weight=steer_w,
         prompt_length=prompt_length,
-        loss_aggregation=sampler.loss_aggregation,
+        loss_aggregation=runtime.loss_aggregation,
     )
-    sampler.last_step_debug.update(term_stats)
-    gx = _calc_grad_suffix(sampler, loss_for_grad, onehot, retain_graph=True)
-    sampler.last_step_debug["grad_norm"] = float(gx.float().norm().item())
+    runtime.last_step_debug.update(term_stats)
+    gx = _calc_grad_suffix(prompt_length, loss_for_grad, onehot, retain_graph=True)
+    runtime.last_step_debug["grad_norm"] = float(gx.float().norm().item())
     bias = torch.zeros_like(x)
     t_use = min(int(bias.shape[1]), int(gx.shape[1]))
     v_use = min(int(bias.shape[2]), int(gx.shape[2]))
     if t_use > 0 and v_use > 0:
         bias[:, :t_use, :v_use] = -gx[:, :t_use, :v_use]
 
-    _loss_for_grad, output_ids, sampled_ids, attr_losses_np = sampler.compute_p_lm_soft(
-        loss_for_grad, output_ids, onehot, logits, attr_losses
+    _loss_for_grad, output_ids, _sampled_ids, attr_losses_np = compute_p_lm_soft(
+        runtime, loss_for_grad, output_ids, onehot, logits, attr_losses
     )
-    sampled_full = torch.cat([output_ids[:, :prompt_length].long(), sampled_ids.long()], dim=1)
-    sampler.last_step_debug["bias_norm"] = float(bias.float().norm().item())
+    runtime.last_step_debug["bias_norm"] = float(bias.float().norm().item())
     attr_losses_t = torch.as_tensor(attr_losses_np, dtype=torch.float32).reshape(-1)
     attr_loss = float(attr_losses_t[0].item())
-    return bias, float(loss.item()), output_ids.detach(), sampled_full.detach(), attr_loss, dict(sampler.last_step_debug)
+    return bias, float(loss.item()), output_ids.detach(), attr_loss, dict(runtime.last_step_debug)
 
 
 def one_step_sampled_l2(
-    sampler: LangevinSampler,
+    runtime: DlpRuntime,
     x: torch.Tensor,
     *,
     prompt_length: int,
-) -> tuple[torch.Tensor, float, torch.Tensor, torch.Tensor, float, dict[str, Any]]:
-    steer_w = float(sampler.weight_val)
-    cur_step_idx = int(sampler._langevin_step)
+) -> tuple[torch.Tensor, float, torch.Tensor, float, dict[str, Any]]:
+    steer_w = float(runtime.weight_val)
+    cur_step_idx = int(runtime._langevin_step)
     if VERBOSE:
         print(f"\n[VERBOSE] === one_step_sampled_l2 step={cur_step_idx} steer_w={steer_w:.6f} ===")
         _vt("x (cur_batch input) [B,gen_steps,vocab]", x)
 
-    scale_mode = sampler._resolve_scale_mode_for_step(step_idx=cur_step_idx)
-    sampler.model.set_biases(
+    scale_mode = _resolve_scale_mode_for_step(runtime, step_idx=cur_step_idx)
+    assert runtime.model is not None
+    runtime.model.set_biases(
         batch_size=x.size(0),
         seq_len=x.size(1) + int(prompt_length),
         prompt_length=prompt_length,
         attribute=None,
-        device=sampler.device,
-        disc_weight=sampler.weight_val,
+        device=runtime.device,
+        disc_weight=runtime.weight_val,
         use_scale_weights=scale_mode,
-        **sampler._set_bias_kwargs,
+        **runtime._set_bias_kwargs,
     )
-    sampler.last_step_debug["scale_mode"] = str(scale_mode)
-    sampler._langevin_step += 1
-    sampler.last_step_debug["steer_weight"] = steer_w
+    runtime.last_step_debug["scale_mode"] = str(scale_mode)
+    runtime._langevin_step += 1
+    runtime.last_step_debug["steer_weight"] = steer_w
 
     batch_size = x.size(0)
     bias_dim = x.size(-1)
@@ -214,6 +469,7 @@ def one_step_sampled_l2(
         dtype=x.dtype,
     )
     x_full = torch.cat([prompt_bias, x], dim=1)
+    assert runtime.inputs is not None and runtime.discriminator is not None
     (
         loss,
         loss_for_grad,
@@ -226,22 +482,21 @@ def one_step_sampled_l2(
         _lm_reg,
         _loss_per_sample,
     ) = compute_steered_loss(
-        sampler.model,
-        sampler.discriminator,
-        sampler._inputs,
+        runtime.model,
+        runtime.discriminator,
+        runtime.inputs,
         x_full,
         weight=steer_w,
         prompt_length=prompt_length,
-        loss_aggregation=sampler.loss_aggregation,
+        loss_aggregation=runtime.loss_aggregation,
     )
-    sampler.last_step_debug.update(term_stats)
+    runtime.last_step_debug.update(term_stats)
 
-    _loss_for_grad, output_ids, sampled_ids, attr_losses_np = sampler.compute_p_lm_soft(
-        loss_for_grad, output_ids, onehot, logits, attr_losses
+    _loss_for_grad, output_ids, sampled_ids, attr_losses_np = compute_p_lm_soft(
+        runtime, loss_for_grad, output_ids, onehot, logits, attr_losses
     )
-    bias = sampler.compute_bias_l2_pen(sampled_ids, steer_weight=steer_w)
-    sampled_full = torch.cat([output_ids[:, :prompt_length].long(), sampled_ids.long()], dim=1)
-    sampler.last_step_debug["bias_norm"] = float(bias.float().norm().item())
+    bias = compute_bias_l2_pen(runtime, sampled_ids, steer_weight=steer_w)
+    runtime.last_step_debug["bias_norm"] = float(bias.float().norm().item())
     attr_losses_t = torch.as_tensor(attr_losses_np, dtype=torch.float32).reshape(-1)
     attr_loss = float(attr_losses_t[0].item())
-    return bias, float(loss.item()), output_ids.detach(), sampled_full.detach(), attr_loss, dict(sampler.last_step_debug)
+    return bias, float(loss.item()), output_ids.detach(), attr_loss, dict(runtime.last_step_debug)

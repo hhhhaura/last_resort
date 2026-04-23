@@ -298,7 +298,7 @@ class AnticipationForDLP(nn.Module):
                     pos = int(cur_ids.shape[1]) - 1
                     if 0 <= pos < biases.shape[1]:
                         bias_row = biases[:, pos, : self.vocab_size].to(next_logits.dtype)
-                        delta = weight_f * bias_row
+                        delta = weight_f * bias_row # is this the main reason!!
                         next_logits = _apply_dlp_bias_to_logits(
                             next_logits,
                             bias_row,

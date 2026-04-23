@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import csv
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,14 @@ def _validate_dependencies(conf: dict[str, Any]) -> None:
         raise FileNotFoundError("Missing required dependency paths:\n" + "\n".join(missing))
 
 
+def _ensure_incremental_metrics_csv(run_dir: Path) -> None:
+    csv_path = run_dir / "incremental_metrics.csv"
+    if csv_path.is_file():
+        return
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        csv.writer(f).writerow(["prompt_idx", "id", "clap", "mean_clap", "n_clap"])
+
+
 def main() -> None:
     assert_frozen_constraints()
     _set_all_seeds(int(SEED))
@@ -46,6 +55,7 @@ def main() -> None:
 
     run_dir = ensure_run_dir(Path(RUN_DIR))
     write_conf(run_dir, CONF)
+    _ensure_incremental_metrics_csv(run_dir)
     print(f"[last_resort] root={ROOT}")
     print(f"[last_resort] run_dir={run_dir.resolve()}")
     print(
@@ -57,7 +67,7 @@ def main() -> None:
     )
 
     device = str(CONF["device"])
-    model, discriminator, sampler = load_run_stack(CONF)
+    model, discriminator, runtime = load_run_stack(CONF)
 
     prompt_items = read_prompt_items(
         Path(str(CONF["prompt_csv"])),
@@ -93,7 +103,7 @@ def main() -> None:
         result = run_single_prompt(
             model=model,
             discriminator=discriminator,
-            sampler=sampler,
+            runtime=runtime,
             conf=CONF,
             device=device,
             prompt_idx=p_idx,

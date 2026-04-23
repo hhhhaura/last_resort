@@ -11,11 +11,16 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from sampler import LangevinSampler
 from utils import _decode_ids_simple, _save_rendered_outputs, get_cached_clap_model, resolve_soundfont_for_wav
 
 from constants import MAX_RENDER_STEPS, RENDER_EVERY_STEP, SAVE_MIDI, SAVE_WAV, TRACE_NUM_STEPS
-from direct_grad_core import ids_hash, one_step_direct_grad, one_step_sampled_l2
+from direct_grad_core import (
+    DlpRuntime,
+    ids_hash,
+    initialize_dlp_batch,
+    one_step_direct_grad,
+    one_step_sampled_l2,
+)
 
 
 @dataclass
@@ -166,7 +171,7 @@ def run_single_prompt(
     *,
     model: Any,
     discriminator: Any,
-    sampler: LangevinSampler,
+    runtime: DlpRuntime,
     conf: dict[str, Any],
     device: str,
     prompt_idx: int,
@@ -184,7 +189,8 @@ def run_single_prompt(
     }
     discriminator.set_text_prompt([prompt_text], [1.0], batch_size=1, device=torch.device(device))
 
-    inputs, cur_batch = sampler.initialize_batch(
+    inputs, cur_batch = initialize_dlp_batch(
+        runtime,
         model=model,
         discriminator=discriminator,
         batch_size=1,
@@ -224,23 +230,19 @@ def run_single_prompt(
 
     with steps_jsonl.open("w", encoding="utf-8") as jf:
         for step in range(int(TRACE_NUM_STEPS)):
-            cur_batch, loss_value, output_ids, sampled_full, attr_loss, step_debug = step_fn(
-                sampler,
+            cur_batch, loss_value, output_ids, attr_loss, step_debug = step_fn(
+                runtime,
                 cur_batch,
                 prompt_length=prompt_len,
             )
             normal_line = _decode_ids_simple(output_ids)[0]
-            sampled_line = _decode_ids_simple(sampled_full)[0]
             normal_ids = [int(x) for x in normal_line.split()] if normal_line.strip() else []
-            sampled_ids = [int(x) for x in sampled_line.split()] if sampled_line.strip() else []
             row = {
                 "step": step,
                 "loss": float(loss_value),
                 "attr_loss": float(attr_loss),
                 "normal_len": len(normal_ids),
-                "sampled_len": len(sampled_ids),
                 "normal_hash": ids_hash(normal_ids) if normal_ids else "",
-                "sampled_hash": ids_hash(sampled_ids) if sampled_ids else "",
                 "debug": step_debug,
             }
             jf.write(json.dumps(row, ensure_ascii=True) + "\n")
@@ -248,7 +250,6 @@ def run_single_prompt(
             step_rows.append(row)
 
             (txt_dir / f"step_{step:03d}_normal.txt").write_text(normal_line + "\n", encoding="utf-8")
-            (txt_dir / f"step_{step:03d}_sampled.txt").write_text(sampled_line + "\n", encoding="utf-8")
 
             render_allowed = bool(RENDER_EVERY_STEP)
             if int(MAX_RENDER_STEPS) > 0 and step >= int(MAX_RENDER_STEPS):
@@ -266,18 +267,6 @@ def run_single_prompt(
                     log_label=f"step={step} type=normal",
                     log_tag="[last_resort]",
                 )
-                _save_rendered_outputs(
-                    run_dir=prompt_dir,
-                    stem=f"step_{step:03d}_sampled",
-                    prompt=prompt_text,
-                    guided_token_lines=[sampled_line],
-                    save_midi=bool(SAVE_MIDI),
-                    save_wav=save_wav,
-                    sound_font=(resolved_sound_font or ""),
-                    wav_sample_rate=wav_sr,
-                    log_label=f"step={step} type=sampled",
-                    log_tag="[last_resort]",
-                )
                 wav_rel = rendered_normal[0].get("wav") if rendered_normal else None
                 wav_abs = (prompt_dir / str(wav_rel)) if isinstance(wav_rel, str) and wav_rel else None
                 step_to_normal_wav[step] = wav_abs
@@ -291,7 +280,7 @@ def run_single_prompt(
             print(
                 f"[last_resort] step={step:03d} "
                 f"loss={loss_value:.6f} attr_loss={attr_loss:.6f} "
-                f"normal_hash={row['normal_hash']} sampled_hash={row['sampled_hash']} "
+                f"normal_hash={row['normal_hash']} "
                 f"grad_norm={step_debug.get('grad_norm', 0.0):.4f} "
                 f"bias_norm={step_debug.get('bias_norm', 0.0):.4f}"
             )
