@@ -137,7 +137,7 @@ def compute_steered_loss(
     weight,
     prompt_length=None,
     target_density=None,
-    loss_aggregation: str = "mean",
+    loss_aggregation: str = "none",
 ):
     del target_density
     debug_trace = bool(inputs.get("debug_trace_sequences", False))
@@ -221,39 +221,12 @@ def compute_steered_loss(
     w_bias = float(getattr(discriminator, "bias_reg_weight", 0.01))
     loss_per_sample = (w_attr * attr_losses) + (w_lm * lm_reg) + (w_bias * bias_reg)
     agg = str(loss_aggregation).strip().lower()
-    if agg not in {"mean", "none", "prompt_mean"}:
+    if agg != "none":
         raise ValueError(
-            f"Unsupported loss_aggregation={loss_aggregation!r}; use 'mean', 'none', or 'prompt_mean'."
+            f"Unsupported loss_aggregation={loss_aggregation!r}; only 'none' is supported."
         )
-    prompt_group_count = 0.0
-    if agg == "none":
-        loss_for_grad = loss_per_sample
-        loss = loss_per_sample.mean()
-    elif agg == "mean":
-        loss_for_grad = loss_per_sample.mean()
-        loss = loss_for_grad
-    else:
-        prompt_group_ids = inputs.get("prompt_group_ids")
-        if prompt_group_ids is None:
-            raise ValueError("loss_aggregation='prompt_mean' requires inputs['prompt_group_ids'].")
-        group = torch.as_tensor(prompt_group_ids, device=loss_per_sample.device, dtype=torch.long).view(-1)
-        if group.numel() != loss_per_sample.numel():
-            raise ValueError(
-                "prompt_group_ids length mismatch: "
-                f"got {int(group.numel())}, expected {int(loss_per_sample.numel())}"
-            )
-        uniq, inv = torch.unique(group, sorted=False, return_inverse=True)
-        sums = torch.zeros_like(uniq, dtype=loss_per_sample.dtype)
-        counts = torch.zeros_like(uniq, dtype=loss_per_sample.dtype)
-        sums = sums.scatter_add(0, inv, loss_per_sample)
-        counts = counts.scatter_add(0, inv, torch.ones_like(loss_per_sample))
-        per_prompt_mean = sums / counts.clamp_min(1.0)
-        prompt_group_count = float(uniq.numel())
-        # Keep prompt-level scalars for gradient path (no second aggregation across prompts).
-        # Broadcast prompt means back to rows so calc_grad can compute row-wise grads.
-        loss_for_grad = per_prompt_mean[inv]
-        # Scalar loss is kept for logging/compatibility.
-        loss = per_prompt_mean.mean()
+    loss_for_grad = loss_per_sample
+    loss = loss_per_sample.mean()
 
     attr_mean = attr_losses.mean()
     lm_mean = lm_reg.mean()
@@ -273,7 +246,6 @@ def compute_steered_loss(
         "weighted_lm": float(weighted_lm.detach().item()),
         "weighted_bias": float(weighted_bias.detach().item()),
         "loss_aggregation": agg,
-        "loss_prompt_groups": prompt_group_count,
     }
     return (
         loss,

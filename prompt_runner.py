@@ -15,7 +15,7 @@ from sampler import LangevinSampler
 from utils import _decode_ids_simple, _save_rendered_outputs, get_cached_clap_model, resolve_soundfont_for_wav
 
 from constants import MAX_RENDER_STEPS, RENDER_EVERY_STEP, SAVE_MIDI, SAVE_WAV, TRACE_NUM_STEPS
-from direct_grad_core import ids_hash, one_step_direct_grad
+from direct_grad_core import ids_hash, one_step_direct_grad, one_step_sampled_l2
 
 
 @dataclass
@@ -181,7 +181,6 @@ def run_single_prompt(
         "input_ids": input_ids,
         "attention_mask": torch.ones_like(input_ids, dtype=torch.long),
         "debug_trace_sequences": False,
-        "prompt_group_ids": torch.tensor([0], dtype=torch.long, device=device),
     }
     discriminator.set_text_prompt([prompt_text], [1.0], batch_size=1, device=torch.device(device))
 
@@ -215,10 +214,17 @@ def run_single_prompt(
     final_wav_abs: Path | None = None
     step_rows: list[dict[str, Any]] = []
     step_to_normal_wav: dict[int, Path | None] = {}
+    bias_update_mode = str(conf.get("bias_update_mode", "direct_grad")).strip().lower()
+    if bias_update_mode == "direct_grad":
+        step_fn = one_step_direct_grad
+    elif bias_update_mode == "sampled_l2":
+        step_fn = one_step_sampled_l2
+    else:
+        raise ValueError(f"Unsupported bias_update_mode={bias_update_mode!r}. Use: direct_grad | sampled_l2")
 
     with steps_jsonl.open("w", encoding="utf-8") as jf:
         for step in range(int(TRACE_NUM_STEPS)):
-            cur_batch, loss_value, output_ids, sampled_full, attr_loss, step_debug = one_step_direct_grad(
+            cur_batch, loss_value, output_ids, sampled_full, attr_loss, step_debug = step_fn(
                 sampler,
                 cur_batch,
                 prompt_length=prompt_len,

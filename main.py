@@ -10,8 +10,8 @@ from constants import CONF, ROOT, RUN_DIR, SEED, assert_frozen_constraints
 
 from prompt_runner import IncrementalClapMetricsLogger, read_prompt_items, run_single_prompt
 
-from io_layout import ensure_run_dir, prompt_dir_for, write_conf
 from direct_grad_core import load_run_stack, set_seed
+from utils import ensure_run_dir, prompt_dir_for, write_conf
 
 
 def _set_all_seeds(seed: int) -> None:

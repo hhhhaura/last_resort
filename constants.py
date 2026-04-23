@@ -86,6 +86,8 @@ def assert_frozen_constraints() -> None:
         raise ValueError("last_resort requires use_scale_weights='full'.")
     if str(CONF.get("bias_update_mode")) != "direct_grad":
         raise ValueError("last_resort requires bias_update_mode='direct_grad'.")
+    if str(CONF.get("loss_aggregation", "")).strip().lower() != "none":
+        raise ValueError("last_resort requires loss_aggregation='none'.")
     if int(CONF.get("per_sample_batch_size", 1)) != 1:
         raise ValueError("last_resort requires per_sample_batch_size=1.")
     if int(CONF.get("prompt_batch_size", 1)) != 1:

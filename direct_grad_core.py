@@ -72,33 +72,29 @@ def _calc_grad_suffix(
         raise TypeError(f"loss_for_grad must be a tensor, got {type(loss_for_grad)}")
     pl = int(sampler.prompt_length)
 
-    if loss_for_grad.ndim == 0:
-        gx_all = torch.autograd.grad(loss_for_grad, onehot, retain_graph=retain_graph, allow_unused=True)[0]
-        if gx_all is None:
-            raise RuntimeError("Gradient is None for scalar loss_for_grad.")
-        gx = gx_all[:, pl:, :]
-    elif loss_for_grad.ndim == 1:
-        bsz = int(loss_for_grad.shape[0])
-        if bsz != int(onehot.shape[0]):
-            raise ValueError(
-                "loss_for_grad batch mismatch: "
-                f"loss_for_grad={tuple(loss_for_grad.shape)} onehot={tuple(onehot.shape)}"
-            )
-        rows = []
-        for b in range(bsz):
-            retain_this = bool(retain_graph) or (b < (bsz - 1))
-            g_all = torch.autograd.grad(
-                loss_for_grad[b],
-                onehot,
-                retain_graph=retain_this,
-                allow_unused=True,
-            )[0]
-            if g_all is None:
-                raise RuntimeError(f"Gradient is None for loss_for_grad[{b}].")
-            rows.append(g_all[b : b + 1, pl:, :])
-        gx = torch.cat(rows, dim=0)
-    else:
-        raise ValueError(f"loss_for_grad must be scalar or [B], got shape={tuple(loss_for_grad.shape)}")
+    if loss_for_grad.ndim != 1:
+        raise ValueError(
+            f"loss_for_grad must be 1D [B] (per-sample); got shape={tuple(loss_for_grad.shape)}"
+        )
+    bsz = int(loss_for_grad.shape[0])
+    if bsz != int(onehot.shape[0]):
+        raise ValueError(
+            "loss_for_grad batch mismatch: "
+            f"loss_for_grad={tuple(loss_for_grad.shape)} onehot={tuple(onehot.shape)}"
+        )
+    rows = []
+    for b in range(bsz):
+        retain_this = bool(retain_graph) or (b < (bsz - 1))
+        g_all = torch.autograd.grad(
+            loss_for_grad[b],
+            onehot,
+            retain_graph=retain_this,
+            allow_unused=True,
+        )[0]
+        if g_all is None:
+            raise RuntimeError(f"Gradient is None for loss_for_grad[{b}].")
+        rows.append(g_all[b : b + 1, pl:, :])
+    gx = torch.cat(rows, dim=0)
 
     gx = torch.nan_to_num(gx, nan=0.0, posinf=0.0, neginf=0.0)
     gx = gx.clamp(min=-1e3, max=1e3)
@@ -174,6 +170,76 @@ def one_step_direct_grad(
     _loss_for_grad, output_ids, sampled_ids, attr_losses_np = sampler.compute_p_lm_soft(
         loss_for_grad, output_ids, onehot, logits, attr_losses
     )
+    sampled_full = torch.cat([output_ids[:, :prompt_length].long(), sampled_ids.long()], dim=1)
+    sampler.last_step_debug["bias_norm"] = float(bias.float().norm().item())
+    attr_losses_t = torch.as_tensor(attr_losses_np, dtype=torch.float32).reshape(-1)
+    attr_loss = float(attr_losses_t[0].item())
+    return bias, float(loss.item()), output_ids.detach(), sampled_full.detach(), attr_loss, dict(sampler.last_step_debug)
+
+
+def one_step_sampled_l2(
+    sampler: LangevinSampler,
+    x: torch.Tensor,
+    *,
+    prompt_length: int,
+) -> tuple[torch.Tensor, float, torch.Tensor, torch.Tensor, float, dict[str, Any]]:
+    steer_w = float(sampler.weight_val)
+    cur_step_idx = int(sampler._langevin_step)
+    if VERBOSE:
+        print(f"\n[VERBOSE] === one_step_sampled_l2 step={cur_step_idx} steer_w={steer_w:.6f} ===")
+        _vt("x (cur_batch input) [B,gen_steps,vocab]", x)
+
+    scale_mode = sampler._resolve_scale_mode_for_step(step_idx=cur_step_idx)
+    sampler.model.set_biases(
+        batch_size=x.size(0),
+        seq_len=x.size(1) + int(prompt_length),
+        prompt_length=prompt_length,
+        attribute=None,
+        device=sampler.device,
+        disc_weight=sampler.weight_val,
+        use_scale_weights=scale_mode,
+        **sampler._set_bias_kwargs,
+    )
+    sampler.last_step_debug["scale_mode"] = str(scale_mode)
+    sampler._langevin_step += 1
+    sampler.last_step_debug["steer_weight"] = steer_w
+
+    batch_size = x.size(0)
+    bias_dim = x.size(-1)
+    prompt_bias = torch.zeros(
+        batch_size,
+        prompt_length,
+        bias_dim,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    x_full = torch.cat([prompt_bias, x], dim=1)
+    (
+        loss,
+        loss_for_grad,
+        output_ids,
+        onehot,
+        logits,
+        attr_losses,
+        term_stats,
+        _pred_vecs,
+        _lm_reg,
+        _loss_per_sample,
+    ) = compute_steered_loss(
+        sampler.model,
+        sampler.discriminator,
+        sampler._inputs,
+        x_full,
+        weight=steer_w,
+        prompt_length=prompt_length,
+        loss_aggregation=sampler.loss_aggregation,
+    )
+    sampler.last_step_debug.update(term_stats)
+
+    _loss_for_grad, output_ids, sampled_ids, attr_losses_np = sampler.compute_p_lm_soft(
+        loss_for_grad, output_ids, onehot, logits, attr_losses
+    )
+    bias = sampler.compute_bias_l2_pen(sampled_ids, steer_weight=steer_w)
     sampled_full = torch.cat([output_ids[:, :prompt_length].long(), sampled_ids.long()], dim=1)
     sampler.last_step_debug["bias_norm"] = float(bias.float().norm().item())
     attr_losses_t = torch.as_tensor(attr_losses_np, dtype=torch.float32).reshape(-1)
