@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -172,33 +173,41 @@ def _pick_selected_step(
     return -1, "none"
 
 
-def run_single_prompt(
+def run_prompts(
     *,
     model: Any,
     discriminator: Any,
     runtime: DlpRuntime,
     conf: dict[str, Any],
     device: str,
-    prompt_idx: int,
-    prompt_id: int,
-    prompt_text: str,
-    prompt_dir: Path,
-) -> PromptRunResult:
-    prompt_tokens: list[int] = []
-    prompt_len = len(prompt_tokens)
-    input_ids = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
+    prompt_indices: list[int],
+    prompt_ids: list[int],
+    prompt_texts: list[str],
+    prompt_dirs: list[Path],
+    batch_size: int,
+) -> list[PromptRunResult]:
+    actual_batch = int(len(prompt_indices))
+    assert actual_batch == int(batch_size)
+    assert actual_batch == int(len(prompt_ids)) == int(len(prompt_texts)) == int(len(prompt_dirs))
+    prompt_len = 0
+    input_ids = torch.zeros((actual_batch, prompt_len), dtype=torch.long, device=device)
     inputs = {
         "input_ids": input_ids,
         "attention_mask": torch.ones_like(input_ids, dtype=torch.long),
         "debug_trace_sequences": False,
     }
-    discriminator.set_text_prompt([prompt_text], [1.0], batch_size=1, device=torch.device(device))
+    discriminator.set_text_prompt(
+        prompt_texts,
+        [1.0] * actual_batch,
+        batch_size=actual_batch,
+        device=torch.device(device),
+    )
 
     inputs, cur_batch = initialize_dlp_batch(
         runtime,
         model=model,
         discriminator=discriminator,
-        batch_size=1,
+        batch_size=actual_batch,
         seq_length=int(conf["seq_len"]),
         prompt_length=prompt_len,
         inputs=inputs,
@@ -208,23 +217,32 @@ def run_single_prompt(
         do_sample=bool(conf.get("do_sample", True)),
     )
 
-    txt_dir = prompt_dir / "text"
-    txt_dir.mkdir(parents=True, exist_ok=True)
-    steps_jsonl = prompt_dir / "steps.jsonl"
+    txt_dirs: list[Path] = []
+    steps_jsonls: list[Path] = []
+    for prompt_dir in prompt_dirs:
+        txt_dir = prompt_dir / "text"
+        txt_dir.mkdir(parents=True, exist_ok=True)
+        txt_dirs.append(txt_dir)
+        steps_jsonls.append(prompt_dir / "steps.jsonl")
 
     sound_font = str(conf.get("sound_font", ""))
     resolved_sound_font = resolve_soundfont_for_wav(sound_font, log_tag="[last_resort]") if SAVE_WAV else None
     save_wav = bool(SAVE_WAV) and (resolved_sound_font is not None)
     wav_sr = int(conf.get("wav_sample_rate", 44100))
 
-    print(f"[last_resort] prompt_idx={prompt_idx} prompt_id={prompt_id} prompt={prompt_text!r}")
-    print(f"[last_resort] device={device} num_steps={TRACE_NUM_STEPS} max_ctx={int(conf['seq_len'])}")
+    for i in range(actual_batch):
+        print(
+            f"[last_resort] prompt_idx={prompt_indices[i]} prompt_id={prompt_ids[i]} prompt={prompt_texts[i]!r}"
+        )
+    print(
+        f"[last_resort] device={device} batch_size={actual_batch} "
+        f"num_steps={TRACE_NUM_STEPS} max_ctx={int(conf['seq_len'])}"
+    )
 
-    best_step = -1
-    best_attr_loss = float("inf")
-    final_wav_abs: Path | None = None
-    step_rows: list[dict[str, Any]] = []
-    step_to_normal_wav: dict[int, Path | None] = {}
+    best_step = [-1] * actual_batch
+    best_attr_loss = [float("inf")] * actual_batch
+    step_rows: list[list[dict[str, Any]]] = [[] for _ in range(actual_batch)]
+    step_to_normal_wav: list[dict[int, Path | None]] = [{} for _ in range(actual_batch)]
     bias_update_mode = str(conf.get("bias_update_mode", "direct_grad")).strip().lower()
     if bias_update_mode == "direct_grad":
         step_fn = one_step_direct_grad
@@ -233,117 +251,139 @@ def run_single_prompt(
     else:
         raise ValueError(f"Unsupported bias_update_mode={bias_update_mode!r}. Use: direct_grad | sampled_l2")
 
-    with steps_jsonl.open("w", encoding="utf-8") as jf:
+    with ExitStack() as stack:
+        step_writers = [
+            stack.enter_context(p.open("w", encoding="utf-8"))
+            for p in steps_jsonls
+        ]
         for step in range(int(TRACE_NUM_STEPS)):
-            cur_batch, loss_value, output_ids, attr_loss, step_debug = step_fn(
+            cur_batch, loss_values, output_ids, attr_losses, step_debugs = step_fn(
                 runtime,
                 cur_batch,
                 prompt_length=prompt_len,
             )
-            normal_line = _decode_ids_simple(output_ids)[0]
-            normal_ids = [int(x) for x in normal_line.split()] if normal_line.strip() else []
-            row = {
-                "step": step,
-                "loss": float(loss_value),
-                "attr_loss": float(attr_loss),
-                "normal_len": len(normal_ids),
-                "normal_hash": ids_hash(normal_ids) if normal_ids else "",
-                "debug": step_debug,
-            }
-            jf.write(json.dumps(row, ensure_ascii=True) + "\n")
-            jf.flush()
-            step_rows.append(row)
+            decoded_lines = _decode_ids_simple(output_ids)
+            for i in range(actual_batch):
+                loss_value = float(loss_values[i].item())
+                attr_loss = float(attr_losses[i].item())
+                step_debug = dict(step_debugs[i])
+                normal_line = decoded_lines[i]
+                normal_ids = [int(x) for x in normal_line.split()] if normal_line.strip() else []
+                row = {
+                    "step": step,
+                    "loss": loss_value,
+                    "attr_loss": attr_loss,
+                    "normal_len": len(normal_ids),
+                    "normal_hash": ids_hash(normal_ids) if normal_ids else "",
+                    "debug": step_debug,
+                }
+                step_writers[i].write(json.dumps(row, ensure_ascii=True) + "\n")
+                step_writers[i].flush()
+                step_rows[i].append(row)
 
-            (txt_dir / f"step_{step:03d}_normal.txt").write_text(normal_line + "\n", encoding="utf-8")
+                (txt_dirs[i] / f"step_{step:03d}_normal.txt").write_text(normal_line + "\n", encoding="utf-8")
 
-            render_allowed = bool(RENDER_EVERY_STEP)
-            if int(MAX_RENDER_STEPS) > 0 and step >= int(MAX_RENDER_STEPS):
-                render_allowed = False
-            if render_allowed:
-                rendered_normal = _save_rendered_outputs(
-                    run_dir=prompt_dir,
-                    stem=f"step_{step:03d}_normal",
-                    prompt=prompt_text,
-                    guided_token_lines=[normal_line],
-                    save_midi=bool(SAVE_MIDI),
-                    save_wav=save_wav,
-                    sound_font=(resolved_sound_font or ""),
-                    wav_sample_rate=wav_sr,
-                    log_label=f"step={step} type=normal",
-                    log_tag="[last_resort]",
+                render_allowed = bool(RENDER_EVERY_STEP)
+                if int(MAX_RENDER_STEPS) > 0 and step >= int(MAX_RENDER_STEPS):
+                    render_allowed = False
+                if render_allowed:
+                    rendered_normal = _save_rendered_outputs(
+                        run_dir=prompt_dirs[i],
+                        stem=f"step_{step:03d}_normal",
+                        prompt=prompt_texts[i],
+                        guided_token_lines=[normal_line],
+                        save_midi=bool(SAVE_MIDI),
+                        save_wav=save_wav,
+                        sound_font=(resolved_sound_font or ""),
+                        wav_sample_rate=wav_sr,
+                        log_label=f"step={step} type=normal",
+                        log_tag="[last_resort]",
+                    )
+                    wav_rel = rendered_normal[0].get("wav") if rendered_normal else None
+                    wav_abs = (
+                        prompt_dirs[i] / str(wav_rel)
+                        if isinstance(wav_rel, str) and wav_rel
+                        else None
+                    )
+                    step_to_normal_wav[i][step] = wav_abs
+                else:
+                    step_to_normal_wav[i][step] = None
+
+                if attr_loss < best_attr_loss[i]:
+                    best_attr_loss[i] = attr_loss
+                    best_step[i] = int(step)
+
+                print(
+                    f"[last_resort] prompt_idx={prompt_indices[i]} step={step:03d} "
+                    f"loss={loss_value:.6f} attr_loss={attr_loss:.6f} "
+                    f"normal_hash={row['normal_hash']} "
+                    f"grad_norm={step_debug.get('grad_norm', 0.0):.4f} "
+                    f"bias_norm={step_debug.get('bias_norm', 0.0):.4f}"
                 )
-                wav_rel = rendered_normal[0].get("wav") if rendered_normal else None
-                wav_abs = (prompt_dir / str(wav_rel)) if isinstance(wav_rel, str) and wav_rel else None
-                step_to_normal_wav[step] = wav_abs
-            else:
-                step_to_normal_wav[step] = None
 
-            if attr_loss < best_attr_loss:
-                best_attr_loss = float(attr_loss)
-                best_step = int(step)
+    out: list[PromptRunResult] = []
+    for i in range(actual_batch):
+        selected_step, selected_policy = _pick_selected_step(
+            step_rows[i],
+            lm_threshold=float(conf.get("selection_lm_loss_threshold", 1.0)),
+        )
+        final_wav_abs = step_to_normal_wav[i].get(selected_step)
+        selected_row = None
+        for r in step_rows[i]:
+            if int(r.get("step", -1)) == selected_step and r.get("phase") != "final_ext":
+                selected_row = r
+                break
+        selected_loss = (
+            float(selected_row["loss"])
+            if selected_row and isinstance(selected_row.get("loss"), (int, float))
+            else float("nan")
+        )
+        selected_attr = (
+            float(selected_row["attr_loss"])
+            if selected_row and isinstance(selected_row.get("attr_loss"), (int, float))
+            else float("nan")
+        )
+        selected_lm = (
+            float((selected_row.get("debug") or {}).get("lm_mean"))
+            if selected_row and isinstance((selected_row.get("debug") or {}).get("lm_mean"), (int, float))
+            else float("nan")
+        )
 
-            print(
-                f"[last_resort] step={step:03d} "
-                f"loss={loss_value:.6f} attr_loss={attr_loss:.6f} "
-                f"normal_hash={row['normal_hash']} "
-                f"grad_norm={step_debug.get('grad_norm', 0.0):.4f} "
-                f"bias_norm={step_debug.get('bias_norm', 0.0):.4f}"
+        summary = {
+            "prompt_idx": int(prompt_indices[i]),
+            "prompt_id": int(prompt_ids[i]),
+            "prompt": prompt_texts[i],
+            "num_steps": int(TRACE_NUM_STEPS),
+            "best_step_by_attr_loss": int(best_step[i]),
+            "best_attr_loss": float(best_attr_loss[i]),
+            "prompt_dir": str(prompt_dirs[i]),
+            "steps_file": str(steps_jsonls[i]),
+            "save_midi": bool(SAVE_MIDI),
+            "save_wav": bool(save_wav),
+            "final_ext_pass": False,
+            "rows_written": len(step_rows[i]),
+            "selection_lm_threshold": float(conf.get("selection_lm_loss_threshold", 1.0)),
+            "selected_policy": selected_policy,
+            "selected_step": int(selected_step),
+            "selected_wav": str(final_wav_abs) if final_wav_abs is not None else "",
+            "selected_loss": selected_loss if math.isfinite(selected_loss) else "",
+            "selected_attr_loss": selected_attr if math.isfinite(selected_attr) else "",
+            "selected_lm_mean": selected_lm if math.isfinite(selected_lm) else "",
+        }
+        (prompt_dirs[i] / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        print(f"[last_resort] wrote summary: {prompt_dirs[i] / 'summary.json'}")
+
+        out.append(
+            PromptRunResult(
+                prompt_idx=prompt_indices[i],
+                prompt_id=prompt_ids[i],
+                prompt_text=prompt_texts[i],
+                prompt_dir=prompt_dirs[i],
+                best_step_by_attr_loss=best_step[i],
+                best_attr_loss=best_attr_loss[i],
+                final_wav_abs=final_wav_abs,
+                selected_step=selected_step,
+                selected_policy=selected_policy,
             )
-
-    selected_step, selected_policy = _pick_selected_step(
-        step_rows,
-        lm_threshold=float(conf.get("selection_lm_loss_threshold", 1.0)),
-    )
-    final_wav_abs = step_to_normal_wav.get(selected_step)
-    selected_row = None
-    for r in step_rows:
-        if int(r.get("step", -1)) == selected_step and r.get("phase") != "final_ext":
-            selected_row = r
-            break
-    selected_loss = float(selected_row["loss"]) if selected_row and isinstance(selected_row.get("loss"), (int, float)) else float("nan")
-    selected_attr = (
-        float(selected_row["attr_loss"])
-        if selected_row and isinstance(selected_row.get("attr_loss"), (int, float))
-        else float("nan")
-    )
-    selected_lm = (
-        float((selected_row.get("debug") or {}).get("lm_mean"))
-        if selected_row and isinstance((selected_row.get("debug") or {}).get("lm_mean"), (int, float))
-        else float("nan")
-    )
-
-    summary = {
-        "prompt_idx": int(prompt_idx),
-        "prompt_id": int(prompt_id),
-        "prompt": prompt_text,
-        "num_steps": int(TRACE_NUM_STEPS),
-        "best_step_by_attr_loss": int(best_step),
-        "best_attr_loss": float(best_attr_loss),
-        "prompt_dir": str(prompt_dir),
-        "steps_file": str(steps_jsonl),
-        "save_midi": bool(SAVE_MIDI),
-        "save_wav": bool(save_wav),
-        "final_ext_pass": False,
-        "rows_written": len(step_rows),
-        "selection_lm_threshold": float(conf.get("selection_lm_loss_threshold", 1.0)),
-        "selected_policy": selected_policy,
-        "selected_step": int(selected_step),
-        "selected_wav": str(final_wav_abs) if final_wav_abs is not None else "",
-        "selected_loss": selected_loss if math.isfinite(selected_loss) else "",
-        "selected_attr_loss": selected_attr if math.isfinite(selected_attr) else "",
-        "selected_lm_mean": selected_lm if math.isfinite(selected_lm) else "",
-    }
-    (prompt_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    print(f"[last_resort] wrote summary: {prompt_dir / 'summary.json'}")
-
-    return PromptRunResult(
-        prompt_idx=prompt_idx,
-        prompt_id=prompt_id,
-        prompt_text=prompt_text,
-        prompt_dir=prompt_dir,
-        best_step_by_attr_loss=best_step,
-        best_attr_loss=best_attr_loss,
-        final_wav_abs=final_wav_abs,
-        selected_step=selected_step,
-        selected_policy=selected_policy,
-    )
+        )
+    return out

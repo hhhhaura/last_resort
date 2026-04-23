@@ -54,8 +54,7 @@ CONF: dict = {
     },
     "start_idx": 0,
     "end_idx": -1,
-    "per_sample_batch_size": 1,
-    "prompt_batch_size": 1,
+    "prompt_batch_size": 4,
     "seq_len": 1023,
     "ctrl_block_length": 510,
     "max_rolling_blocks": 20,
@@ -88,7 +87,5 @@ def assert_frozen_constraints() -> None:
         raise ValueError("last_resort requires bias_update_mode='direct_grad'.")
     if str(CONF.get("loss_aggregation", "")).strip().lower() != "none":
         raise ValueError("last_resort requires loss_aggregation='none'.")
-    if int(CONF.get("per_sample_batch_size", 1)) != 1:
-        raise ValueError("last_resort requires per_sample_batch_size=1.")
-    if int(CONF.get("prompt_batch_size", 1)) != 1:
-        raise ValueError("last_resort requires prompt_batch_size=1.")
+    if int(CONF.get("prompt_batch_size", 1)) < 1:
+        raise ValueError("last_resort requires prompt_batch_size>=1.")

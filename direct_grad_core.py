@@ -545,7 +545,7 @@ def one_step_direct_grad(
     x: torch.Tensor,
     *,
     prompt_length: int,
-) -> tuple[torch.Tensor, float, torch.Tensor, float, dict[str, Any]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
     steer_w = float(runtime.weight_val)
     cur_step_idx = int(runtime._langevin_step)
     if VERBOSE:
@@ -588,7 +588,7 @@ def one_step_direct_grad(
         attr_losses,
         term_stats,
         _pred_vecs,
-        _lm_reg,
+        lm_reg_per_sample,
         _loss_per_sample,
     ) = compute_steered_loss(
         runtime.model,
@@ -599,9 +599,7 @@ def one_step_direct_grad(
         prompt_length=prompt_length,
         loss_aggregation=runtime.loss_aggregation,
     )
-    runtime.last_step_debug.update(term_stats)
     gx = _calc_grad_suffix(prompt_length, loss_for_grad, onehot, retain_graph=True)
-    runtime.last_step_debug["grad_norm"] = float(gx.float().norm().item())
     bias = torch.zeros_like(x)
     t_use = min(int(bias.shape[1]), int(gx.shape[1]))
     v_use = min(int(bias.shape[2]), int(gx.shape[2]))
@@ -611,10 +609,26 @@ def one_step_direct_grad(
     _loss_for_grad, output_ids, _sampled_ids, attr_losses_np = compute_p_lm_soft(
         runtime, loss_for_grad, output_ids, onehot, logits, attr_losses
     )
-    runtime.last_step_debug["bias_norm"] = float(bias.float().norm().item())
     attr_losses_t = torch.as_tensor(attr_losses_np, dtype=torch.float32).reshape(-1)
-    attr_loss = float(attr_losses_t[0].item())
-    return bias, float(loss.item()), output_ids.detach(), attr_loss, dict(runtime.last_step_debug)
+    loss_per_sample = loss_for_grad.detach().float().reshape(-1)
+    grad_norm_per_sample = gx.float().flatten(1).norm(dim=1)
+    bias_norm_per_sample = bias.float().flatten(1).norm(dim=1)
+    step_debugs: list[dict[str, Any]] = []
+    for i in range(int(loss_per_sample.shape[0])):
+        d = dict(term_stats)
+        lm_i = float(lm_reg_per_sample[i].detach().item())
+        d["steer_weight"] = steer_w
+        d["scale_mode"] = str(scale_mode)
+        # Critical for batched selection: use row-local LM metric, not batch mean.
+        d["lm_mean"] = lm_i
+        d["weighted_lm"] = float(d["w_lm"]) * lm_i
+        d["grad_norm"] = float(grad_norm_per_sample[i].item())
+        d["bias_norm"] = float(bias_norm_per_sample[i].item())
+        d["proposal_entropy"] = float("nan")
+        d["proposal_vs_decode_mismatch"] = float("nan")
+        step_debugs.append(d)
+    del loss
+    return bias, loss_per_sample, output_ids.detach(), attr_losses_t.detach(), step_debugs
 
 
 def one_step_sampled_l2(
@@ -622,7 +636,7 @@ def one_step_sampled_l2(
     x: torch.Tensor,
     *,
     prompt_length: int,
-) -> tuple[torch.Tensor, float, torch.Tensor, float, dict[str, Any]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
     steer_w = float(runtime.weight_val)
     cur_step_idx = int(runtime._langevin_step)
     if VERBOSE:
@@ -665,7 +679,7 @@ def one_step_sampled_l2(
         attr_losses,
         term_stats,
         _pred_vecs,
-        _lm_reg,
+        lm_reg_per_sample,
         _loss_per_sample,
     ) = compute_steered_loss(
         runtime.model,
@@ -676,13 +690,28 @@ def one_step_sampled_l2(
         prompt_length=prompt_length,
         loss_aggregation=runtime.loss_aggregation,
     )
-    runtime.last_step_debug.update(term_stats)
-
     _loss_for_grad, output_ids, sampled_ids, attr_losses_np = compute_p_lm_soft(
         runtime, loss_for_grad, output_ids, onehot, logits, attr_losses
     )
     bias = compute_bias_l2_pen(runtime, sampled_ids, steer_weight=steer_w)
-    runtime.last_step_debug["bias_norm"] = float(bias.float().norm().item())
     attr_losses_t = torch.as_tensor(attr_losses_np, dtype=torch.float32).reshape(-1)
-    attr_loss = float(attr_losses_t[0].item())
-    return bias, float(loss.item()), output_ids.detach(), attr_loss, dict(runtime.last_step_debug)
+    loss_per_sample = loss_for_grad.detach().float().reshape(-1)
+    bias_norm_per_sample = bias.float().flatten(1).norm(dim=1)
+    step_debugs: list[dict[str, Any]] = []
+    for i in range(int(loss_per_sample.shape[0])):
+        d = dict(term_stats)
+        lm_i = float(lm_reg_per_sample[i].detach().item())
+        d["steer_weight"] = steer_w
+        d["scale_mode"] = str(scale_mode)
+        # Critical for batched selection: use row-local LM metric, not batch mean.
+        d["lm_mean"] = lm_i
+        d["weighted_lm"] = float(d["w_lm"]) * lm_i
+        d["bias_norm"] = float(bias_norm_per_sample[i].item())
+        d["grad_norm"] = float("nan")
+        d["proposal_entropy"] = float(runtime.last_step_debug.get("proposal_entropy", float("nan")))
+        d["proposal_vs_decode_mismatch"] = float(
+            runtime.last_step_debug.get("proposal_vs_decode_mismatch", float("nan"))
+        )
+        step_debugs.append(d)
+    del loss
+    return bias, loss_per_sample, output_ids.detach(), attr_losses_t.detach(), step_debugs
