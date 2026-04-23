@@ -22,14 +22,7 @@ CONF: dict = {
     "use_scale_weights": "full",
     "debug_trace_sequences": False,
     "loss_aggregation": "none",
-    "bias_update_mode": "direct_grad_norm_matched",
-    "direct_grad_ar_event_only": True,
-    "direct_grad_norm_match_eps": 1.0e-8,
-    "direct_grad_norm_match_masked_full": True,
-    "direct_grad_norm_match_topk": True,
-    "direct_grad_norm_match_topk_k": 0,
-    "direct_grad_norm_match_ratio_min": 0.001,
-    "direct_grad_norm_match_ratio_max": 10000.0,
+    "bias_update_mode": "direct_grad",
     "selection_lm_loss_threshold": 1.0,
     "selection_attr_convergence_threshold": 0.8,
     "experiment_type": "ttm",
@@ -91,8 +84,8 @@ SAVE_MIDI = bool(CONF["save_midi"])
 def assert_frozen_constraints() -> None:
     if str(CONF.get("use_scale_weights")) != "full":
         raise ValueError("last_resort requires use_scale_weights='full'.")
-    if str(CONF.get("bias_update_mode")) != "direct_grad_norm_matched":
-        raise ValueError("last_resort requires bias_update_mode='direct_grad_norm_matched'.")
+    if str(CONF.get("bias_update_mode")) != "direct_grad":
+        raise ValueError("last_resort requires bias_update_mode='direct_grad'.")
     if int(CONF.get("per_sample_batch_size", 1)) != 1:
         raise ValueError("last_resort requires per_sample_batch_size=1.")
     if int(CONF.get("prompt_batch_size", 1)) != 1:

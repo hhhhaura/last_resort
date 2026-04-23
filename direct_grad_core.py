@@ -105,23 +105,16 @@ def _calc_grad_suffix(
     return gx.detach()
 
 
-def one_step_with_direct_norm_matched_bias(
+def one_step_direct_grad(
     sampler: LangevinSampler,
     x: torch.Tensor,
     *,
     prompt_length: int,
-    ar_event_only: bool,
-    norm_match_eps: float,
-    use_masked_full_vocab_norm: bool,
-    use_lm_topk_support_norm: bool,
-    topk_k: int,
-    ratio_min: float,
-    ratio_max: float,
 ) -> tuple[torch.Tensor, float, torch.Tensor, torch.Tensor, float, dict[str, Any]]:
     steer_w = float(sampler.weight_val)
     cur_step_idx = int(sampler._langevin_step)
     if VERBOSE:
-        print(f"\n[VERBOSE] === one_step_with_direct_norm_matched_bias step={cur_step_idx} steer_w={steer_w:.6f} ===")
+        print(f"\n[VERBOSE] === one_step_direct_grad step={cur_step_idx} steer_w={steer_w:.6f} ===")
         _vt("x (cur_batch input) [B,gen_steps,vocab]", x)
 
     scale_mode = sampler._resolve_scale_mode_for_step(step_idx=cur_step_idx)
@@ -172,36 +165,17 @@ def one_step_with_direct_norm_matched_bias(
     sampler.last_step_debug.update(term_stats)
     gx = _calc_grad_suffix(sampler, loss_for_grad, onehot, retain_graph=True)
     sampler.last_step_debug["grad_norm"] = float(gx.float().norm().item())
-    active_vocab_size = int(
-        getattr(sampler.discriminator, "active_vocab_size", int(sampler.model.get_input_embeddings().weight.size(0)))
-    )
-    # NOTE: bypass norm-matching and use direct negative gradient as bias.
-    # Original norm-matched construction is intentionally disabled:
-    # bias, nm_stats = _build_direct_norm_matched_bias(...)
     bias = torch.zeros_like(x)
     t_use = min(int(bias.shape[1]), int(gx.shape[1]))
     v_use = min(int(bias.shape[2]), int(gx.shape[2]))
     if t_use > 0 and v_use > 0:
         bias[:, :t_use, :v_use] = -gx[:, :t_use, :v_use]
-    nm_stats = {
-        "norm_match_ratio_mean": -1.0,
-        "norm_match_ratio_median": -1.0,
-        "norm_match_bn_tiny_frac": -1.0,
-        "norm_match_steps_used": float(t_use),
-        "norm_match_use_masked_full_vocab_norm": -1.0,
-        "norm_match_use_lm_topk_support_norm": -1.0,
-        "norm_match_topk_k": -1.0,
-        "norm_match_ratio_min": -1.0,
-        "norm_match_ratio_max": -1.0,
-        "norm_match_active_vocab_cap": float(active_vocab_size),
-    }
 
     _loss_for_grad, output_ids, sampled_ids, attr_losses_np = sampler.compute_p_lm_soft(
         loss_for_grad, output_ids, onehot, logits, attr_losses
     )
     sampled_full = torch.cat([output_ids[:, :prompt_length].long(), sampled_ids.long()], dim=1)
     sampler.last_step_debug["bias_norm"] = float(bias.float().norm().item())
-    sampler.last_step_debug.update(nm_stats)
     attr_losses_t = torch.as_tensor(attr_losses_np, dtype=torch.float32).reshape(-1)
     attr_loss = float(attr_losses_t[0].item())
     return bias, float(loss.item()), output_ids.detach(), sampled_full.detach(), attr_loss, dict(sampler.last_step_debug)

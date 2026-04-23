@@ -11,8 +11,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from constants import AR_EVENT_VOCAB_SIZE
-
 from steering import compute_steered_loss
 
 EPS = 1e-10
@@ -73,115 +71,6 @@ def _calc_grad_suffix(
     return gx.detach()
 
 
-def _build_direct_norm_matched_bias(
-    *,
-    gx: torch.Tensor,
-    logits: torch.Tensor,
-    prompt_length: int,
-    steer_weight: float,
-    bias_shape: tuple[int, int, int],
-    ar_event_only: bool,
-    eps: float,
-    use_masked_full_vocab_norm: bool,
-    use_lm_topk_support_norm: bool,
-    topk_k: int,
-    active_vocab_size: int,
-    ratio_min: float,
-    ratio_max: float,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    bsz, gen_steps, vocab = bias_shape
-    bias = torch.zeros((bsz, gen_steps, vocab), device=gx.device, dtype=gx.dtype)
-
-    logits_suffix = torch.nan_to_num(
-        logits[:, int(prompt_length) :, :].float(),
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    )
-    gx = torch.nan_to_num(gx.float(), nan=0.0, posinf=0.0, neginf=0.0)
-    t = min(int(gx.shape[1]), int(logits_suffix.shape[1]), int(gen_steps))
-    if t <= 0:
-        return bias, {
-            "norm_match_ratio_mean": 0.0,
-            "norm_match_ratio_median": 0.0,
-            "norm_match_bn_tiny_frac": 1.0,
-            "norm_match_steps_used": 0.0,
-        }
-
-    v_keep = int(vocab)
-    if ar_event_only:
-        v_keep = min(v_keep, int(AR_EVENT_VOCAB_SIZE))
-
-    k_req = int(max(1, min(int(topk_k), int(v_keep)))) if use_lm_topk_support_norm else 0
-
-    gx_use = gx[:, :t, :v_keep]
-    logits_use = logits_suffix[:, :t, :v_keep]
-    b_raw = -gx_use
-
-    bn = b_raw.norm(p=2, dim=-1, keepdim=True)
-    bn_denom = bn.clamp_min(float(eps))
-
-    finite_mask = torch.isfinite(logits_use) & torch.isfinite(b_raw)
-    logits_masked = torch.where(
-        finite_mask,
-        logits_use,
-        torch.zeros((), device=logits_use.device, dtype=logits_use.dtype),
-    )
-
-    ratio_parts: list[torch.Tensor] = []
-
-    if use_masked_full_vocab_norm:
-        ln_mask = logits_masked.norm(p=2, dim=-1, keepdim=True)
-        r = (ln_mask / bn_denom).clamp(min=float(ratio_min), max=float(ratio_max))
-        r = torch.nan_to_num(r, nan=0.0, posinf=float(ratio_max), neginf=float(ratio_min))
-        ratio_parts.append(r)
-
-    if use_lm_topk_support_norm:
-        k = int(k_req)
-        topk_ids = torch.topk(logits_masked, k=k, dim=-1).indices.to(dtype=torch.long)
-        z_logits = torch.gather(logits_masked, dim=-1, index=topk_ids).float()
-        z_g = torch.gather(b_raw, dim=-1, index=topk_ids).float()
-        ln_top = z_logits.norm(p=2, dim=-1, keepdim=True)
-        bn_top = z_g.norm(p=2, dim=-1, keepdim=True).clamp_min(float(eps))
-        r = (ln_top / bn_top).clamp(min=float(ratio_min), max=float(ratio_max))
-        r = torch.nan_to_num(r, nan=0.0, posinf=float(ratio_max), neginf=float(ratio_min))
-        ratio_parts.append(r)
-
-    if not ratio_parts:
-        ln = logits_use.norm(p=2, dim=-1, keepdim=True)
-        r = (ln / bn_denom).clamp(min=float(ratio_min), max=float(ratio_max))
-        r = torch.nan_to_num(r, nan=0.0, posinf=float(ratio_max), neginf=float(ratio_min))
-        ratio_parts.append(r)
-
-    scale = ratio_parts[0]
-    for r_extra in ratio_parts[1:]:
-        scale = torch.sqrt(torch.clamp(scale, min=float(ratio_min), max=float(ratio_max)) * r_extra)
-
-    scaled = b_raw * scale
-    scaled = torch.nan_to_num(scaled, nan=0.0, posinf=0.0, neginf=0.0)
-    scaled = scaled * float(steer_weight)
-
-    bias[:, :t, :v_keep] = scaled.to(dtype=bias.dtype)
-
-    ratio = scale.reshape(-1)
-    bn_flat = bn.reshape(-1)
-    tiny_frac = float((bn_flat <= float(eps)).float().mean().item())
-    ratio = torch.nan_to_num(ratio, nan=0.0, posinf=0.0, neginf=0.0)
-    stats = {
-        "norm_match_ratio_mean": float(ratio.mean().item()) if ratio.numel() else 0.0,
-        "norm_match_ratio_median": float(ratio.median().item()) if ratio.numel() else 0.0,
-        "norm_match_bn_tiny_frac": tiny_frac,
-        "norm_match_steps_used": float(t),
-        "norm_match_use_masked_full_vocab_norm": float(bool(use_masked_full_vocab_norm)),
-        "norm_match_use_lm_topk_support_norm": float(bool(use_lm_topk_support_norm)),
-        "norm_match_topk_k": float(k_req),
-        "norm_match_ratio_min": float(ratio_min),
-        "norm_match_ratio_max": float(ratio_max),
-        "norm_match_active_vocab_cap": float(int(active_vocab_size)),
-    }
-    return bias, stats
-
-
 class LangevinSampler(BaseSampler):
     def __init__(
         self,
@@ -196,13 +85,6 @@ class LangevinSampler(BaseSampler):
         initialization_noise_rate=0.5,
         loss_aggregation="mean",
         bias_update_mode="sampled_l2",
-        direct_grad_ar_event_only=True,
-        direct_grad_norm_match_eps=1.0e-8,
-        direct_grad_norm_match_masked_full=True,
-        direct_grad_norm_match_topk=True,
-        direct_grad_norm_match_topk_k=0,
-        direct_grad_norm_match_ratio_min=1.0e-3,
-        direct_grad_norm_match_ratio_max=1.0e4,
         **kwargs,
     ):
         super().__init__()
@@ -223,24 +105,11 @@ class LangevinSampler(BaseSampler):
                 f"Unsupported loss_aggregation={loss_aggregation!r}. Use: mean | none | prompt_mean"
             )
         self.bias_update_mode = str(bias_update_mode).strip().lower()
-        if self.bias_update_mode not in {"sampled_l2", "direct_grad_norm_matched"}:
+        if self.bias_update_mode not in {"sampled_l2", "direct_grad"}:
             raise ValueError(
                 "Unsupported bias_update_mode="
-                f"{bias_update_mode!r}. Use: sampled_l2 | direct_grad_norm_matched"
+                f"{bias_update_mode!r}. Use: sampled_l2 | direct_grad"
             )
-        self.direct_grad_ar_event_only = bool(direct_grad_ar_event_only)
-        self.direct_grad_norm_match_eps = float(direct_grad_norm_match_eps)
-        self.direct_grad_norm_match_masked_full = bool(direct_grad_norm_match_masked_full)
-        self.direct_grad_norm_match_topk = bool(direct_grad_norm_match_topk)
-        self.direct_grad_norm_match_topk_k = int(direct_grad_norm_match_topk_k)
-        self.direct_grad_norm_match_ratio_min = float(direct_grad_norm_match_ratio_min)
-        self.direct_grad_norm_match_ratio_max = float(direct_grad_norm_match_ratio_max)
-        if self.direct_grad_norm_match_eps <= 0.0:
-            raise ValueError("direct_grad_norm_match_eps must be > 0.")
-        if self.direct_grad_norm_match_ratio_min <= 0.0 or self.direct_grad_norm_match_ratio_max <= 0.0:
-            raise ValueError("direct_grad_norm_match_ratio_min/max must be > 0.")
-        if self.direct_grad_norm_match_ratio_min > self.direct_grad_norm_match_ratio_max:
-            raise ValueError("direct_grad_norm_match_ratio_min must be <= direct_grad_norm_match_ratio_max.")
         self._langevin_step = 0
         self.last_step_debug = {}
         self.prev_output_ids = None
@@ -550,7 +419,7 @@ class LangevinSampler(BaseSampler):
         self.prev_pred_vecs = pred_vecs.clone()
 
         direct_gx = None
-        if self.bias_update_mode == "direct_grad_norm_matched":
+        if self.bias_update_mode == "direct_grad":
             # compute_p_lm_soft() also reads gradients from the same graph; take the
             # direct-gradient snapshot first and retain graph for the proposal read.
             direct_gx = _calc_grad_suffix(self, loss_for_grad, onehot, retain_graph=True)
@@ -558,34 +427,15 @@ class LangevinSampler(BaseSampler):
         _loss_for_grad, output_ids, sampled_ids, attr_losses = self.compute_p_lm_soft(
             loss_for_grad, output_ids, onehot, logits, attr_losses
         )
-        if self.bias_update_mode == "direct_grad_norm_matched":
+        if self.bias_update_mode == "direct_grad":
             if direct_gx is None:
-                raise RuntimeError("direct_grad_norm_matched selected but direct gradient snapshot is missing.")
-            active_vocab_size = int(
-                getattr(self.discriminator, "active_vocab_size", int(self.model.get_input_embeddings().weight.size(0)))
-            )
-            nm_topk_k = (
-                int(self.direct_grad_norm_match_topk_k)
-                if int(self.direct_grad_norm_match_topk_k) > 0
-                else int(self.k_val)
-            )
-            bias, nm_stats = _build_direct_norm_matched_bias(
-                gx=direct_gx,
-                logits=logits,
-                prompt_length=self.prompt_length,
-                steer_weight=steer_w,
-                bias_shape=tuple(x.shape),
-                ar_event_only=bool(self.direct_grad_ar_event_only),
-                eps=float(self.direct_grad_norm_match_eps),
-                use_masked_full_vocab_norm=bool(self.direct_grad_norm_match_masked_full),
-                use_lm_topk_support_norm=bool(self.direct_grad_norm_match_topk),
-                topk_k=int(nm_topk_k),
-                active_vocab_size=active_vocab_size,
-                ratio_min=float(self.direct_grad_norm_match_ratio_min),
-                ratio_max=float(self.direct_grad_norm_match_ratio_max),
-            )
+                raise RuntimeError("direct_grad selected but direct gradient snapshot is missing.")
+            bias = torch.zeros_like(x)
+            t_use = min(int(bias.shape[1]), int(direct_gx.shape[1]))
+            v_use = min(int(bias.shape[2]), int(direct_gx.shape[2]))
+            if t_use > 0 and v_use > 0:
+                bias[:, :t_use, :v_use] = -direct_gx[:, :t_use, :v_use]
             self.last_step_debug["bias_update_mode"] = self.bias_update_mode
-            self.last_step_debug.update(nm_stats)
         else:
             bias = self.compute_bias_l2_pen(sampled_ids, steer_weight=steer_w)
             self.last_step_debug["bias_update_mode"] = self.bias_update_mode

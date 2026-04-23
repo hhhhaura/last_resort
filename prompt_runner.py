@@ -15,7 +15,7 @@ from sampler import LangevinSampler
 from utils import _decode_ids_simple, _save_rendered_outputs, get_cached_clap_model, resolve_soundfont_for_wav
 
 from constants import MAX_RENDER_STEPS, RENDER_EVERY_STEP, SAVE_MIDI, SAVE_WAV, TRACE_NUM_STEPS
-from direct_grad_core import ids_hash, one_step_with_direct_norm_matched_bias
+from direct_grad_core import ids_hash, one_step_direct_grad
 
 
 @dataclass
@@ -218,17 +218,10 @@ def run_single_prompt(
 
     with steps_jsonl.open("w", encoding="utf-8") as jf:
         for step in range(int(TRACE_NUM_STEPS)):
-            cur_batch, loss_value, output_ids, sampled_full, attr_loss, step_debug = one_step_with_direct_norm_matched_bias(
+            cur_batch, loss_value, output_ids, sampled_full, attr_loss, step_debug = one_step_direct_grad(
                 sampler,
                 cur_batch,
                 prompt_length=prompt_len,
-                ar_event_only=bool(conf["direct_grad_ar_event_only"]),
-                norm_match_eps=float(conf["direct_grad_norm_match_eps"]),
-                use_masked_full_vocab_norm=bool(conf["direct_grad_norm_match_masked_full"]),
-                use_lm_topk_support_norm=bool(conf["direct_grad_norm_match_topk"]),
-                topk_k=int(conf["direct_grad_norm_match_topk_k"]) if int(conf["direct_grad_norm_match_topk_k"]) > 0 else int(conf["k_val"]),
-                ratio_min=float(conf["direct_grad_norm_match_ratio_min"]),
-                ratio_max=float(conf["direct_grad_norm_match_ratio_max"]),
             )
             normal_line = _decode_ids_simple(output_ids)[0]
             sampled_line = _decode_ids_simple(sampled_full)[0]
@@ -293,8 +286,8 @@ def run_single_prompt(
                 f"[last_resort] step={step:03d} "
                 f"loss={loss_value:.6f} attr_loss={attr_loss:.6f} "
                 f"normal_hash={row['normal_hash']} sampled_hash={row['sampled_hash']} "
-                f"ratio_mean={step_debug.get('norm_match_ratio_mean', 0.0):.4f} "
-                f"tiny_frac={step_debug.get('norm_match_bn_tiny_frac', 0.0):.4f}"
+                f"grad_norm={step_debug.get('grad_norm', 0.0):.4f} "
+                f"bias_norm={step_debug.get('bias_norm', 0.0):.4f}"
             )
 
     selected_step, selected_policy = _pick_selected_step(
@@ -330,8 +323,6 @@ def run_single_prompt(
         "steps_file": str(steps_jsonl),
         "save_midi": bool(SAVE_MIDI),
         "save_wav": bool(save_wav),
-        "ar_event_only": bool(conf["direct_grad_ar_event_only"]),
-        "norm_match_eps": float(conf["direct_grad_norm_match_eps"]),
         "final_ext_pass": False,
         "rows_written": len(step_rows),
         "selection_lm_threshold": float(conf.get("selection_lm_loss_threshold", 1.0)),
