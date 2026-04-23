@@ -11,12 +11,17 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from utils import _decode_ids_simple, _save_rendered_outputs, get_cached_clap_model, resolve_soundfont_for_wav
+from utils import (
+    _decode_ids_simple,
+    _save_rendered_outputs,
+    get_cached_clap_model,
+    ids_hash,
+    resolve_soundfont_for_wav,
+)
 
 from constants import MAX_RENDER_STEPS, RENDER_EVERY_STEP, SAVE_MIDI, SAVE_WAV, TRACE_NUM_STEPS
 from direct_grad_core import (
     DlpRuntime,
-    ids_hash,
     initialize_dlp_batch,
     one_step_direct_grad,
     one_step_sampled_l2,

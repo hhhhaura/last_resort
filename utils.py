@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import array
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,21 @@ from anticipation.convert import events_to_midi, midi_to_wav
 from anticipation.vocab import AUTOREGRESS, SEPARATOR, TIME_OFFSET
 
 _clap_model_cache: dict[tuple[str, str], Any] = {}
+
+
+def ids_hash(ids: list[int]) -> str:
+    arr = array.array("q", [int(x) for x in ids])
+    return hashlib.sha1(arr.tobytes()).hexdigest()[:12]
+
+
+def _trace_seq(runtime: Any, name: str, x: torch.Tensor) -> None:
+    if not bool(getattr(runtime, "debug_trace_sequences", False)):
+        return
+    flat = x.detach().cpu().reshape(-1).tolist()
+    print(
+        f"[dlp] trace {name}: shape={tuple(x.shape)} "
+        f"prefix10={flat[:10]} suffix10={flat[-10:] if flat else []}"
+    )
 
 
 def _decode_ids_simple(ids_tensor: torch.Tensor) -> list[str]:

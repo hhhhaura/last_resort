@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-import array
-import hashlib
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from steering import compute_steered_loss
+from constants import AR_EVENT_VOCAB_SIZE
+from utils import _trace_seq, ids_hash
 
 VERBOSE = True
 
@@ -112,24 +112,210 @@ def load_run_stack(conf: dict[str, Any]) -> tuple[Any, Any, DlpRuntime]:
     return model, discriminator, runtime
 
 
-def ids_hash(ids: list[int]) -> str:
-    arr = array.array("q", [int(x) for x in ids])
-    return hashlib.sha1(arr.tobytes()).hexdigest()[:12]
-
-
-def _trace_seq(runtime: DlpRuntime, name: str, x: torch.Tensor) -> None:
-    if not runtime.debug_trace_sequences:
-        return
-    flat = x.detach().cpu().reshape(-1).tolist()
-    print(
-        f"[dlp] trace {name}: shape={tuple(x.shape)} "
-        f"prefix10={flat[:10]} suffix10={flat[-10:] if flat else []}"
-    )
-
-
 def _resolve_scale_mode_for_step(runtime: DlpRuntime, *, step_idx: int) -> bool:
     del step_idx
     return runtime.use_scale_weights
+
+
+def _bridge_valid_mask(
+    output_ids: torch.Tensor,
+    out_len: int,
+) -> torch.Tensor:
+    """Mask valid AR-event ids for bridge positions; control/special ids are removed."""
+    end = int(out_len)
+    tok = output_ids[:, :end].long()
+    if tok.shape[1] != int(out_len):
+        raise ValueError(
+            f"bridge mask length mismatch: got={tok.shape[1]} expected={int(out_len)}. "
+            "dab_ttm requires strict equal-length, non-padded sequences."
+        )
+    valid = (tok >= 0) & (tok < AR_EVENT_VOCAB_SIZE)
+    return valid.to(dtype=torch.float32, device=output_ids.device)
+
+
+def _sanitize_disc_bridge_inputs(
+    disc_onehot: torch.Tensor, mask_gen: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Make discriminator bridge inputs numerically/statically safe for GEMM."""
+    if disc_onehot.ndim != 3:
+        raise ValueError(f"disc_onehot must be 3D [B,S,V], got shape={tuple(disc_onehot.shape)}")
+    if mask_gen.ndim != 2:
+        raise ValueError(f"mask_gen must be 2D [B,S], got shape={tuple(mask_gen.shape)}")
+    if disc_onehot.shape[0] != mask_gen.shape[0] or disc_onehot.shape[1] != mask_gen.shape[1]:
+        raise ValueError(
+            "disc_onehot/mask_gen shape mismatch: "
+            f"disc_onehot={tuple(disc_onehot.shape)} mask_gen={tuple(mask_gen.shape)}"
+        )
+    # Student bridge does x @ w; keep x in fp32 to avoid bf16 GEMM instability.
+    x = torch.nan_to_num(disc_onehot.float(), nan=0.0, posinf=0.0, neginf=0.0).contiguous()
+    m = torch.nan_to_num(mask_gen.float(), nan=0.0, posinf=0.0, neginf=0.0).contiguous()
+    # Zero-out fully invalid rows explicitly (already masked) for extra stability.
+    valid_any = m.any(dim=1, keepdim=True)
+    # Avoid CUDA sync (.item) in error states; mask invalid rows unconditionally.
+    x = x * valid_any.unsqueeze(-1).to(dtype=x.dtype)
+    return x, m
+
+
+def _align_suffix_tensors(
+    output_ids: torch.Tensor,
+    gpt_logit: torch.Tensor,
+    onehot_generates: torch.Tensor,
+    biases: torch.Tensor,
+    prompt_length: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Align LM/onehot/bias suffix lengths to a shared time axis."""
+    t_logits = int(gpt_logit[:, prompt_length:, :].shape[1])
+    t_onehot = int(onehot_generates[:, prompt_length:, :].shape[1])
+    t_bias = int(biases[:, prompt_length:, :].shape[1])
+    t = min(t_logits, t_onehot, t_bias)
+    if t <= 0:
+        raise ValueError(
+            f"invalid aligned suffix length: logits={t_logits}, onehot={t_onehot}, bias={t_bias}"
+        )
+    lm_logp = torch.log_softmax(gpt_logit[:, prompt_length : prompt_length + t, :].float(), dim=-1)
+    oh_suffix = onehot_generates[:, prompt_length : prompt_length + t, :AR_EVENT_VOCAB_SIZE].float()
+    bias_var = biases[:, prompt_length : prompt_length + t, :AR_EVENT_VOCAB_SIZE].float()
+    suffix_ids = output_ids[:, prompt_length : prompt_length + t].long()
+    return lm_logp, oh_suffix, bias_var, suffix_ids
+
+
+def compute_steered_loss(
+    model,
+    discriminator,
+    inputs,
+    biases,
+    *,
+    weight,
+    prompt_length=None,
+    loss_aggregation: str = "none",
+):
+    debug_trace = bool(inputs.get("debug_trace_sequences", False))
+    output_ids, gpt_logit = model.forward_with_biases(
+        **inputs,
+        labels=inputs,
+        use_full_prompt=False,
+        biases=biases,
+        bias_rep_space="logit",
+        weight=weight,
+    )
+
+    if prompt_length is None:
+        raise ValueError("prompt_length is required for bridge-guided steering.")
+
+    emb = model.get_input_embeddings()
+    tok = output_ids.long()
+    if debug_trace:
+        flat = tok.detach().cpu().reshape(-1).tolist()
+        print(
+            f"[dlp] trace output_ids: shape={tuple(tok.shape)} "
+            f"prefix10={flat[:10]} suffix10={flat[-10:] if flat else []}"
+        )
+    vdim = int(model.vocab_size)
+    tok_valid = (tok >= 0) & (tok < vdim)
+    if not bool(tok_valid.all().item()):
+        bad = (~tok_valid).nonzero(as_tuple=False)
+        ex = bad[:8].detach().cpu().tolist()
+        raise ValueError(
+            "dab_ttm steering received out-of-range token ids; padded/sentinel rows are unsupported. "
+            f"examples={ex} vocab_size={vdim}"
+        )
+    tok_safe = tok.clamp(0, vdim - 1)
+    onehot_generates = F.one_hot(tok_safe, num_classes=vdim).to(
+        dtype=emb.weight.dtype, device=output_ids.device
+    )
+    onehot_generates = onehot_generates * tok_valid.unsqueeze(-1).to(dtype=onehot_generates.dtype)
+    onehot_generates = onehot_generates.detach().requires_grad_(True)
+
+    gen_steps = max(int(gpt_logit.shape[1]) - int(prompt_length), 0)
+    del gen_steps
+    if onehot_generates.shape[-1] < AR_EVENT_VOCAB_SIZE:
+        raise ValueError(
+            f"Generator one-hot width {onehot_generates.shape[-1]} < AR_EVENT_VOCAB_SIZE "
+            f"(CONTROL_OFFSET)={AR_EVENT_VOCAB_SIZE}"
+        )
+    disc_onehot = onehot_generates[:, :, :AR_EVENT_VOCAB_SIZE].float()
+    mask_gen = _bridge_valid_mask(
+        output_ids,
+        int(disc_onehot.shape[1]),
+    )
+    mask_gen = mask_gen.to(device=disc_onehot.device, dtype=disc_onehot.dtype)
+    disc_onehot, mask_gen = _sanitize_disc_bridge_inputs(disc_onehot, mask_gen)
+    if debug_trace:
+        flat = disc_onehot.detach().cpu().reshape(-1).tolist()
+        print(
+            f"[dlp] trace disc_onehot: shape={tuple(disc_onehot.shape)} "
+            f"prefix10={flat[:10]} suffix10={flat[-10:] if flat else []}"
+        )
+        flat = mask_gen.detach().cpu().reshape(-1).tolist()
+        print(
+            f"[dlp] trace mask_gen: shape={tuple(mask_gen.shape)} "
+            f"prefix10={flat[:10]} suffix10={flat[-10:] if flat else []}"
+        )
+    pred_vecs, attr_losses = discriminator(disc_onehot, mask_gen)
+
+    lm_logp, oh_suffix, bias_var, suffix_ids = _align_suffix_tensors(
+        output_ids, gpt_logit, onehot_generates, biases, int(prompt_length)
+    )
+    if debug_trace:
+        flat = suffix_ids.float().detach().cpu().reshape(-1).tolist()
+        print(
+            f"[dlp] trace suffix_ids: shape={tuple(suffix_ids.shape)} "
+            f"prefix10={flat[:10]} suffix10={flat[-10:] if flat else []}"
+        )
+    lm_logp = torch.nan_to_num(lm_logp, nan=0.0, posinf=0.0, neginf=-60.0)
+    lm_logp = lm_logp[:, :, :AR_EVENT_VOCAB_SIZE]
+    pad_mask = ((suffix_ids >= 0) & (suffix_ids < AR_EVENT_VOCAB_SIZE)).to(dtype=lm_logp.dtype)
+    denom = pad_mask.sum(dim=1).clamp_min(1.0)
+    lm_tok = -(oh_suffix * lm_logp).sum(dim=-1)
+    lm_reg = (lm_tok * pad_mask).sum(dim=1) / denom
+    # Regularize the actual bias optimization variable x (excluding prompt rows),
+    # not the generated onehot proxy.
+    bias_tok = bias_var.pow(2).mean(dim=-1)
+    bias_reg = (bias_tok * pad_mask).sum(dim=1) / denom
+
+    w_attr = float(getattr(discriminator, "cosine_weight", 1.0))
+    w_lm = float(getattr(discriminator, "lm_reg_weight", 0.2))
+    w_bias = float(getattr(discriminator, "bias_reg_weight", 0.01))
+    loss_per_sample = (w_attr * attr_losses) + (w_lm * lm_reg) + (w_bias * bias_reg)
+    agg = str(loss_aggregation).strip().lower()
+    if agg != "none":
+        raise ValueError(
+            f"Unsupported loss_aggregation={loss_aggregation!r}; only 'none' is supported."
+        )
+    loss_for_grad = loss_per_sample
+    loss = loss_per_sample.mean()
+
+    attr_mean = attr_losses.mean()
+    lm_mean = lm_reg.mean()
+    bias_mean = bias_reg.mean()
+    weighted_attr = w_attr * attr_mean
+    weighted_lm = w_lm * lm_mean
+    weighted_bias = w_bias * bias_mean
+    term_stats = {
+        "attr_mean": float(attr_mean.detach().item()),
+        "lm_mean": float(lm_mean.detach().item()),
+        "bias_mean": float(bias_mean.detach().item()),
+        "pred_norm_mean": float(pred_vecs.detach().float().norm(dim=-1).mean().item()),
+        "w_attr": w_attr,
+        "w_lm": w_lm,
+        "w_bias": w_bias,
+        "weighted_attr": float(weighted_attr.detach().item()),
+        "weighted_lm": float(weighted_lm.detach().item()),
+        "weighted_bias": float(weighted_bias.detach().item()),
+        "loss_aggregation": agg,
+    }
+    return (
+        loss,
+        loss_for_grad,
+        output_ids,
+        onehot_generates,
+        gpt_logit,
+        attr_losses,
+        term_stats,
+        pred_vecs.detach(),
+        lm_reg.detach(),
+        loss_per_sample.detach(),
+    )
 
 
 def _calc_grad_suffix(
