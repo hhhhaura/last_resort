@@ -10,7 +10,7 @@ AR_EVENT_VOCAB_SIZE: int = int(CONTROL_OFFSET)
 
 ROOT = Path(__file__).resolve().parents[1]
 DAB_ROOT = ROOT / "dab_ttm"
-RUN_DIR = ROOT / "last_resort" / "results" / "fixed_direct_grad_dlp38"
+RUN_DIR = ROOT / "last_resort" / "results" / "fixed_direct_attr_only"
 
 # Frozen configuration copied from dab_ttm/results/dlp_38/conf.yaml.
 CONF: dict = {
@@ -40,9 +40,9 @@ CONF: dict = {
         "clamp3_root": "/home/hhhhaura/dmir_lab/CTRL-M//clamp3",
         "clamp3_text_model": "FacebookAI/xlm-roberta-base",
         "clamp3_weights_path": "/home/hhhhaura/dmir_lab/CTRL-M//clamp-anti-bridge/weights/weights_clamp3_c2_h_size_768_t_model_FacebookAI_xlm-roberta-base_t_length_128_a_size_768_a_layers_12_a_length_128_s_size_768_s_layers_12_p_size_64_p_length_512.pth",
-        "attr_weight": 1.0,
+        "attr_weight": 1, #1.0,
         "attr_loss_type": "cosine",
-        "lm_reg_weight": 0.4,
+        "lm_reg_weight": 0, #0.4,
         "bias_reg_weight": 0.0,
     },
     "prompt_csv": "/home/hhhhaura/dmir_lab/CTRL-M/ctrlm-ismir/dab_ttm/prompts/test_subset_prompts.csv",
@@ -54,14 +54,15 @@ CONF: dict = {
     },
     "start_idx": 0,
     "end_idx": -1,
-    "prompt_batch_size": 4,
+    "prompt_batch_size": 1,
     "seq_len": 1023,
     "ctrl_block_length": 510,
     "max_rolling_blocks": 20,
-    "num_steps_first_block": 10,
+    "num_steps_first_block": 5,
     "num_steps_cont_block": 5,
     "temperature": 1.0,
     "top_p": 0.98,
+    # Decoding switch: False => greedy, True => sampling.
     "do_sample": True,
     "save_midi": True,
     "save_wav": True,
@@ -71,7 +72,7 @@ CONF: dict = {
 }
 
 # Fixed direct-grad runner controls.
-SEED = 42
+SEED = 44
 TRACE_NUM_STEPS = int(CONF["num_steps_first_block"])
 MAX_CTX = int(CONF["seq_len"])
 RENDER_EVERY_STEP = True

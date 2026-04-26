@@ -198,8 +198,6 @@ def run_prompts(
     }
     discriminator.set_text_prompt(
         prompt_texts,
-        [1.0] * actual_batch,
-        batch_size=actual_batch,
         device=torch.device(device),
     )
 
@@ -263,10 +261,12 @@ def run_prompts(
                 prompt_length=prompt_len,
             )
             decoded_lines = _decode_ids_simple(output_ids)
+            loss_list = loss_values.detach().float().cpu().tolist()
+            attr_list = attr_losses.detach().float().cpu().tolist()
             for i in range(actual_batch):
-                loss_value = float(loss_values[i].item())
-                attr_loss = float(attr_losses[i].item())
-                step_debug = dict(step_debugs[i])
+                loss_value = float(loss_list[i])
+                attr_loss = float(attr_list[i])
+                step_debug = step_debugs[i]
                 normal_line = decoded_lines[i]
                 normal_ids = [int(x) for x in normal_line.split()] if normal_line.strip() else []
                 row = {
@@ -278,7 +278,6 @@ def run_prompts(
                     "debug": step_debug,
                 }
                 step_writers[i].write(json.dumps(row, ensure_ascii=True) + "\n")
-                step_writers[i].flush()
                 step_rows[i].append(row)
 
                 (txt_dirs[i] / f"step_{step:03d}_normal.txt").write_text(normal_line + "\n", encoding="utf-8")

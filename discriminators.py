@@ -95,7 +95,6 @@ class DistilledClampTextDiscriminator(SoftOnehotSteeringDiscriminator):
         self.lm_reg_weight = float(lm_reg_weight)
         self.bias_reg_weight = float(bias_reg_weight)
         self.cached_text_emb_list: list[torch.Tensor] = []
-        self.cached_prompt_weights: torch.Tensor | None = None
         self.last_prompt_attr_losses: torch.Tensor | None = None
 
         with open(distilled_cfg, "r", encoding="utf-8") as f:
@@ -188,22 +187,15 @@ class DistilledClampTextDiscriminator(SoftOnehotSteeringDiscriminator):
     def set_text_prompt(
         self,
         prompt_texts: list[str] | str,
-        weights: list[float] | None = None,
-        batch_size: int = 1,
         device: torch.device = torch.device("cpu"),
     ) -> None:
         if isinstance(prompt_texts, str):
             prompt_texts = [prompt_texts]
-        if weights is None:
-            weights = [1.0] * len(prompt_texts)
-        if len(prompt_texts) != len(weights):
-            raise ValueError("prompt_texts and weights must have the same length.")
         emb_list: list[torch.Tensor] = []
         for p in prompt_texts:
             emb = self.encode_text_for_row(str(p), device)
-            emb_list.append(emb.repeat(batch_size, 1))
+            emb_list.append(emb)
         self.cached_text_emb_list = emb_list
-        self.cached_prompt_weights = torch.tensor(weights, dtype=torch.float32, device=device)
 
     def forward(self, onehot_generates: torch.Tensor, seq_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         self.last_prompt_attr_losses = None
@@ -226,34 +218,39 @@ class DistilledClampTextDiscriminator(SoftOnehotSteeringDiscriminator):
         )
         pred = self.bridge.distill_head(memory, patch_mask)
 
-        if not self.cached_text_emb_list or self.cached_prompt_weights is None:
+        if not self.cached_text_emb_list:
             raise ValueError(
-                "Text targets not set. Call set_text_prompt(...) so cached_text_emb_list and weights are populated."
+                "Text targets not set. Call set_text_prompt(...) first."
             )
         k = len(self.cached_text_emb_list)
-        if int(self.cached_prompt_weights.numel()) != k:
+        b = int(pred.size(0))
+        if b != k:
             raise ValueError(
-                f"cached_prompt_weights length {self.cached_prompt_weights.numel()} != number of prompts {k}."
+                f"Batch size {b} does not match number of text targets {k}. "
+                "Expected one prompt target per batch row."
             )
-        targets_bkd = torch.stack(
-            [t.to(pred.device, dtype=pred.dtype) for t in self.cached_text_emb_list],
-            dim=1,
+
+        targets_bd = torch.stack(
+            [
+                t.to(pred.device, dtype=pred.dtype).squeeze(0)
+                if t.ndim == 2 and int(t.size(0)) == 1
+                else t.to(pred.device, dtype=pred.dtype)
+                for t in self.cached_text_emb_list
+            ],
+            dim=0,
         )
-        w = self.cached_prompt_weights.to(device=pred.device, dtype=torch.float32)
 
         if self.attr_loss_type == "cosine":
             pred_n = F.normalize(pred, dim=-1)
-            tgt_n = F.normalize(targets_bkd, dim=-1)
-            cos_bk = torch.einsum("bd,bkd->bk", pred_n, tgt_n)
-            loss_bk = 1.0 - cos_bk
+            tgt_n = F.normalize(targets_bd, dim=-1)
+            cos_b = F.cosine_similarity(pred_n, tgt_n, dim=-1)
+            loss_b = 1.0 - cos_b
         else:
             raise ValueError(f"Invalid attr_loss_type: {self.attr_loss_type}")
 
-        w = w / w.sum().clamp_min(1e-12)
-        w = w.to(dtype=loss_bk.dtype)
-        attr_loss = torch.matmul(loss_bk, w)
-        self.last_prompt_attr_losses = loss_bk.detach()
-        return pred, attr_loss * self.attr_weight
+        attr_loss = loss_b
+        self.last_prompt_attr_losses = loss_b.detach().unsqueeze(1)
+        return pred, attr_loss
 
 
 def load_ttm_discriminator(**kwargs):

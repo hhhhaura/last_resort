@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,6 @@ from utils import _trace_seq, ids_hash
 VERBOSE = True
 
 EPS = 1e-10
-
 
 @dataclass
 class DlpRuntime:
@@ -273,7 +273,7 @@ def compute_steered_loss(
     bias_tok = bias_var.pow(2).mean(dim=-1)
     bias_reg = (bias_tok * pad_mask).sum(dim=1) / denom
 
-    w_attr = float(getattr(discriminator, "cosine_weight", 1.0))
+    w_attr = float(getattr(discriminator, "attr_weight", 1.0))
     w_lm = float(getattr(discriminator, "lm_reg_weight", 0.2))
     w_bias = float(getattr(discriminator, "bias_reg_weight", 0.01))
     loss_per_sample = (w_attr * attr_losses) + (w_lm * lm_reg) + (w_bias * bias_reg)
@@ -337,19 +337,27 @@ def _calc_grad_suffix(
             "loss_for_grad batch mismatch: "
             f"loss_for_grad={tuple(loss_for_grad.shape)} onehot={tuple(onehot.shape)}"
         )
-    rows = []
-    for b in range(bsz):
-        retain_this = bool(retain_graph) or (b < (bsz - 1))
-        g_all = torch.autograd.grad(
-            loss_for_grad[b],
-            onehot,
-            retain_graph=retain_this,
-            allow_unused=True,
-        )[0]
-        if g_all is None:
-            raise RuntimeError(f"Gradient is None for loss_for_grad[{b}].")
-        rows.append(g_all[b : b + 1, pl:, :])
-    gx = torch.cat(rows, dim=0)
+    # Exact per-sample batched VJP:
+    # Use identity grad_outputs with is_grads_batched=True to compute
+    # all {d loss[b] / d onehot} in one autograd traversal.
+    eye = torch.eye(bsz, device=loss_for_grad.device, dtype=loss_for_grad.dtype)
+    g_batched = torch.autograd.grad(
+        loss_for_grad,
+        onehot,
+        grad_outputs=eye,
+        retain_graph=bool(retain_graph),
+        allow_unused=True,
+        is_grads_batched=True,
+    )[0]
+    if g_batched is None:
+        raise RuntimeError("Gradient is None for batched loss_for_grad.")
+    if g_batched.ndim != (onehot.ndim + 1):
+        raise RuntimeError(
+            "Unexpected batched gradient rank: "
+            f"got={tuple(g_batched.shape)} expected=(B,{','.join(map(str, onehot.shape))})"
+        )
+    idx = torch.arange(bsz, device=onehot.device)
+    gx = g_batched[idx, idx, pl:, :]
 
     gx = torch.nan_to_num(gx, nan=0.0, posinf=0.0, neginf=0.0)
     gx = gx.clamp(min=-1e3, max=1e3)
@@ -369,10 +377,9 @@ def get_unfiltered_dist(
         cur = cur[:, :t]
         token_dist = token_dist[:, :t, :]
         gx = gx[:, :t, :]
-    token_dist[
-        torch.arange(token_dist.size(0))[:, None, None],
-        torch.arange(token_dist.size(1))[None, :, None],
-    ] = EPS
+    b_idx = torch.arange(token_dist.size(0), device=token_dist.device)[:, None]
+    t_idx = torch.arange(token_dist.size(1), device=token_dist.device)[None, :]
+    token_dist[b_idx, t_idx, cur] = EPS
     unfiltered_dist = gx * token_dist
     return -1 * unfiltered_dist
 
@@ -599,17 +606,14 @@ def one_step_direct_grad(
         prompt_length=prompt_length,
         loss_aggregation=runtime.loss_aggregation,
     )
-    gx = _calc_grad_suffix(prompt_length, loss_for_grad, onehot, retain_graph=True)
+    gx = _calc_grad_suffix(prompt_length, loss_for_grad, onehot, retain_graph=False)
     bias = torch.zeros_like(x)
     t_use = min(int(bias.shape[1]), int(gx.shape[1]))
     v_use = min(int(bias.shape[2]), int(gx.shape[2]))
     if t_use > 0 and v_use > 0:
         bias[:, :t_use, :v_use] = -gx[:, :t_use, :v_use]
 
-    _loss_for_grad, output_ids, _sampled_ids, attr_losses_np = compute_p_lm_soft(
-        runtime, loss_for_grad, output_ids, onehot, logits, attr_losses
-    )
-    attr_losses_t = torch.as_tensor(attr_losses_np, dtype=torch.float32).reshape(-1)
+    attr_losses_t = attr_losses.detach().float().reshape(-1)
     loss_per_sample = loss_for_grad.detach().float().reshape(-1)
     grad_norm_per_sample = gx.float().flatten(1).norm(dim=1)
     bias_norm_per_sample = bias.float().flatten(1).norm(dim=1)
