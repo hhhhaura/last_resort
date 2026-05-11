@@ -39,6 +39,7 @@ def _prepend_sys_path_if_missing(path: str | Path) -> None:
 _distilled_clamp_repo = Path(__file__).resolve().parents[1] / "distilled_clamp"
 _prepend_sys_path_if_missing(_distilled_clamp_repo)
 
+from distilled_clamp.config_phase import get_effective_cfg  # type: ignore
 from distilled_clamp.models.loader import build_distilled_student_from_cfg  # type: ignore
 
 
@@ -98,15 +99,23 @@ class DistilledClampTextDiscriminator(SoftOnehotSteeringDiscriminator):
         self.last_prompt_attr_losses: torch.Tensor | None = None
 
         with open(distilled_cfg, "r", encoding="utf-8") as f:
-            self.distilled_cfg = yaml.safe_load(f)
+            distilled_full_cfg = yaml.safe_load(f)
+        if "phase1" in distilled_full_cfg and "phase2" in distilled_full_cfg:
+            self.distilled_cfg = get_effective_cfg(distilled_full_cfg, "align")
+        else:
+            # Backward compatibility for already-merged/phase-specific config files.
+            self.distilled_cfg = distilled_full_cfg
 
         ckpt = torch.load(distilled_ckpt, map_location="cpu")
         raw_state = ckpt["model"]
-        if not any(k.startswith("input_module.") for k in raw_state.keys()):
+        raw_keys = list(raw_state.keys())
+        if not raw_keys:
+            raise ValueError("distilled_ckpt contains an empty model state_dict.")
+        has_new_keys = any(k.startswith("embedding.") for k in raw_keys)
+        if not has_new_keys:
             raise ValueError(
-                "distilled_ckpt is not a distilled_clamp student checkpoint "
-                "(expected state_dict keys with prefix 'input_module.'). "
-                "Only DistilledAntiClamp2Model weights are supported."
+                "Unsupported distilled_ckpt format. Expected updated "
+                "DistilledAntiClamp2Model keys ('embedding.*', 'encoder.*', ...)."
             )
 
         _prepend_sys_path_if_missing(distilled_root)
@@ -117,9 +126,19 @@ class DistilledClampTextDiscriminator(SoftOnehotSteeringDiscriminator):
                 f"distilled source.vocab_size={self.bridge_vocab_size} must equal AR_EVENT_VOCAB_SIZE "
                 f"(CONTROL_OFFSET)={AR_EVENT_VOCAB_SIZE}; steering passes a fixed AR-event slice."
             )
+        source_cfg = self.distilled_cfg.get("source", {})
+        self.bridge_pad_token_id = int(source_cfg.get("pad_token_id", self.bridge_vocab_size))
+        self.bridge_mask_token_id = int(source_cfg.get("mask_token_id", self.bridge_pad_token_id + 1))
+        self.bridge_embedding_vocab_size = int(self.bridge_mask_token_id + 1)
+        if self.bridge_embedding_vocab_size < (self.bridge_vocab_size + 2):
+            raise ValueError(
+                "distilled source ids are inconsistent: expected pad=vocab_size and mask=pad+1 "
+                f"(got vocab_size={self.bridge_vocab_size}, pad={self.bridge_pad_token_id}, "
+                f"mask={self.bridge_mask_token_id})."
+            )
         self.bridge = build_distilled_student_from_cfg(
             self.distilled_cfg,
-            vocab_size=self.bridge_vocab_size + 1,
+            vocab_size=self.bridge_embedding_vocab_size,
         )
         print("[discriminator] bridge=distilled_clamp (DistilledAntiClamp2Model)")
 
@@ -167,6 +186,11 @@ class DistilledClampTextDiscriminator(SoftOnehotSteeringDiscriminator):
         print(f"[discriminator] distilled_ckpt={distilled_ckpt}")
         print(f"[discriminator] distilled_cfg={distilled_cfg}")
         print(f"[discriminator] distilled_root={distilled_root}")
+        print(
+            "[discriminator] bridge vocab ids: "
+            f"ar={self.bridge_vocab_size} pad={self.bridge_pad_token_id} "
+            f"mask={self.bridge_mask_token_id} embed_vocab={self.bridge_embedding_vocab_size}"
+        )
         print(f"[discriminator] clamp3_root={clamp3_root}")
         print(f"[discriminator] clamp3_text_model={clamp3_text_model}")
         if clamp3_weights_path:
@@ -206,17 +230,29 @@ class DistilledClampTextDiscriminator(SoftOnehotSteeringDiscriminator):
             dtype=onehot_generates.dtype,
             device=onehot_generates.device,
         )
-        onehot_generates = torch.cat([onehot_generates, pad_col], dim=-1)
-        patch_latents, patch_mask = self.bridge.input_module(
-            token_inputs=onehot_generates,
-            attention_mask=seq_mask,
-            inputs_are_one_hot=True,
+        mask_col = torch.zeros_like(pad_col)
+        onehot_generates = torch.cat([onehot_generates, pad_col, mask_col], dim=-1)
+        emb_w = self.bridge.embedding.weight
+        token_inputs = onehot_generates.to(dtype=emb_w.dtype)
+        hidden_in = token_inputs @ emb_w
+        pad_mask = ~seq_mask.bool()
+        hidden = self.bridge.encoder(
+            hidden_in,
+            src_key_padding_mask=pad_mask,
         )
-        memory = self.bridge.m3_core(
-            patch_latents,
-            src_key_padding_mask=~patch_mask.bool(),
+        bsz = hidden.size(0)
+        q = self.bridge.pool_query.expand(bsz, -1, -1)
+        pooled, _ = self.bridge.pool_attn(
+            q,
+            hidden,
+            hidden,
+            key_padding_mask=pad_mask,
+            need_weights=False,
         )
-        pred = self.bridge.distill_head(memory, patch_mask)
+        pooled = pooled.squeeze(1)
+        pred = self.bridge.proj(pooled)
+        pred = self.bridge.out_norm(pred)
+        pred = F.normalize(pred, dim=-1)
 
         if not self.cached_text_emb_list:
             raise ValueError(

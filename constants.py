@@ -10,7 +10,7 @@ AR_EVENT_VOCAB_SIZE: int = int(CONTROL_OFFSET)
 
 ROOT = Path(__file__).resolve().parents[1]
 DAB_ROOT = ROOT / "dab_ttm"
-RUN_DIR = ROOT / "last_resort" / "results" / "fixed_direct_attr_only"
+RUN_DIR = ROOT / "last_resort" / "results" / "distilled_v2_0505"
 
 # Frozen configuration copied from dab_ttm/results/dlp_38/conf.yaml.
 CONF: dict = {
@@ -34,15 +34,15 @@ CONF: dict = {
     },
     "discriminator": {
         "type": "distilled_clamp",
-        "distilled_ckpt": "/home/hhhhaura/dmir_lab/CTRL-M/ctrlm-ismir/distilled_clamp/outputs_mlp_head/checkpoints/input_perceiver_lat4/step_00076800.pt",
-        "distilled_cfg": "/home/hhhhaura/dmir_lab/CTRL-M/ctrlm-ismir/distilled_clamp/configs/mlp_head.yaml",
+        "distilled_ckpt": "/home/hhhhaura/dmir_lab/CTRL-M/ctrlm-ismir/distilled_clamp/outputs_two_phase_align/checkpoints/align/step_00331000.pt",
+        "distilled_cfg": "/home/hhhhaura/dmir_lab/CTRL-M/ctrlm-ismir/distilled_clamp/configs/train_two_phase.yaml",
         "distilled_root": "/home/hhhhaura/dmir_lab/CTRL-M/ctrlm-ismir/distilled_clamp",
         "clamp3_root": "/home/hhhhaura/dmir_lab/CTRL-M//clamp3",
         "clamp3_text_model": "FacebookAI/xlm-roberta-base",
-        "clamp3_weights_path": "/home/hhhhaura/dmir_lab/CTRL-M//clamp-anti-bridge/weights/weights_clamp3_c2_h_size_768_t_model_FacebookAI_xlm-roberta-base_t_length_128_a_size_768_a_layers_12_a_length_128_s_size_768_s_layers_12_p_size_64_p_length_512.pth",
+        "clamp3_weights_path": "/home/hhhhaura/dmir_lab/CTRL-M/ctrlm-ismir/last_resort/weights/weights_clamp3_c2_h_size_768_t_model_FacebookAI_xlm-roberta-base_t_length_128_a_size_768_a_layers_12_a_length_128_s_size_768_s_layers_12_p_size_64_p_length_512.pth",
         "attr_weight": 1, #1.0,
         "attr_loss_type": "cosine",
-        "lm_reg_weight": 0, #0.4,
+        "lm_reg_weight": 0.4, #0.4,
         "bias_reg_weight": 0.0,
     },
     "prompt_csv": "/home/hhhhaura/dmir_lab/CTRL-M/ctrlm-ismir/dab_ttm/prompts/test_subset_prompts.csv",
